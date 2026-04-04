@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --bg-start: #07111f;
+  --bg-end: #13273a;
+  --panel: rgba(8, 15, 29, 0.72);
+  --panel-strong: rgba(11, 18, 35, 0.88);
+  --line: rgba(148, 163, 184, 0.18);
+  --accent: #22c55e;
+  --accent-soft: rgba(34, 197, 94, 0.18);
+  --danger: #fb7185;
+  --text-main: #e2e8f0;
+  --text-muted: #94a3b8;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(34, 197, 94, 0.16), transparent 28%),
+    radial-gradient(circle at top right, rgba(56, 189, 248, 0.14), transparent 24%),
+    linear-gradient(160deg, var(--bg-start), var(--bg-end));
+  color: var(--text-main);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(34, 197, 94, 0.3);
+}

@@ -1,0 +1,10 @@
+node_modules/
+web/node_modules/
+web/dist/assets/
+bin/
+dist/
+run/
+localdrop
+coverage/
+data/
+.DS_Store
