@@ -5,7 +5,8 @@ const records = ref([])
 const storage = ref({
   totalBytes: 0,
   dbBytes: 0,
-  imageBytes: 0
+  imageBytes: 0,
+  fileBytes: 0
 })
 const loading = ref(true)
 const syncingClipboard = ref(false)
@@ -17,6 +18,7 @@ const errorMessage = ref('')
 const pasteFallbackVisible = ref(false)
 const previewRecord = ref(null)
 const lastSyncedAt = ref(null)
+const filterQuery = ref('')
 
 const fileInput = ref(null)
 const imageInput = ref(null)
@@ -27,12 +29,25 @@ let pollTimer = null
 const pinnedCount = computed(() => records.value.filter((item) => item.isTop).length)
 const imageCount = computed(() => records.value.filter((item) => item.contentType === 'image').length)
 const fileCount = computed(() => records.value.filter((item) => item.contentType === 'file').length)
+const normalizedFilterQuery = computed(() => filterQuery.value.trim().toLowerCase())
+const filteredRecords = computed(() => {
+  const keyword = normalizedFilterQuery.value
+  if (!keyword) {
+    return records.value
+  }
+  return records.value.filter((record) => {
+    if (record.contentType === 'text') {
+      return (record.contentBody || '').toLowerCase().includes(keyword)
+    }
+    return fileLabel(record).toLowerCase().includes(keyword)
+  })
+})
 
 const statCards = computed(() => [
   {
     label: '当前占用',
     value: formatBytes(storage.value.totalBytes),
-    detail: `${formatBytes(storage.value.imageBytes)} files + ${formatBytes(storage.value.dbBytes)} db`
+    detail: `${formatBytes(storage.value.imageBytes)} images + ${formatBytes(storage.value.fileBytes)} files + ${formatBytes(storage.value.dbBytes)} db`
   },
   {
     label: '置顶消息',
@@ -349,6 +364,10 @@ function fileLabel(record) {
   return record.fileName || '未命名文件'
 }
 
+function clearFilter() {
+  filterQuery.value = ''
+}
+
 function formatBytes(bytes) {
   if (!bytes) {
     return '0 B'
@@ -527,17 +546,34 @@ function extensionFromMime(type) {
         </div>
 
         <section class="rounded-[28px] border border-white/10 bg-[color:var(--panel)] p-5 backdrop-blur-xl sm:p-6">
-          <div class="flex items-center justify-between gap-4">
+          <div class="flex flex-wrap items-center justify-between gap-4">
             <div>
               <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Feed Stream</p>
               <h2 class="mt-2 text-2xl font-semibold text-slate-50">信息流</h2>
             </div>
-            <button
-              class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10"
-              @click="refreshAll"
-            >
-              立即刷新
-            </button>
+            <div class="flex flex-wrap items-center gap-3">
+              <div class="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-2">
+                <input
+                  v-model="filterQuery"
+                  type="text"
+                  class="w-40 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500 sm:w-56"
+                  placeholder="过滤文本或文件名"
+                />
+                <button
+                  v-if="filterQuery"
+                  class="text-xs text-slate-400 transition hover:text-slate-200"
+                  @click="clearFilter"
+                >
+                  清空
+                </button>
+              </div>
+              <button
+                class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10"
+                @click="refreshAll"
+              >
+                立即刷新
+              </button>
+            </div>
           </div>
 
           <div v-if="loading" class="mt-8 rounded-[24px] border border-white/10 bg-white/[0.03] px-5 py-12 text-center text-slate-400">
@@ -549,9 +585,14 @@ function extensionFromMime(type) {
             <p class="mt-2 text-sm text-slate-400">先试试“同步剪贴板内容”或者拖拽一个文件进来。</p>
           </div>
 
+          <div v-else-if="filteredRecords.length === 0" class="mt-8 rounded-[24px] border border-white/10 bg-white/[0.03] px-5 py-12 text-center">
+            <p class="text-lg font-medium text-slate-100">没有匹配的记录</p>
+            <p class="mt-2 text-sm text-slate-400">试试别的关键字，支持搜索文本内容和文件名。</p>
+          </div>
+
           <div v-else class="mt-6 space-y-4">
             <article
-              v-for="record in records"
+              v-for="record in filteredRecords"
               :key="record.id"
               class="animate-rise rounded-[24px] border p-4 transition hover:-translate-y-0.5 sm:p-5"
               :class="record.isTop ? 'border-emerald-300/30 bg-emerald-400/10' : 'border-white/10 bg-white/[0.03]'"

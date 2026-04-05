@@ -1,6 +1,7 @@
 package localdrop
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -32,7 +33,7 @@ type App struct {
 }
 
 func NewApp(cfg Config, logger *log.Logger) (*App, error) {
-	store, err := OpenStore(cfg.DBPath, cfg.ImagesDir)
+	store, err := OpenStore(cfg.DBPath, cfg.ImagesDir, cfg.FilesDir)
 	if err != nil {
 		return nil, err
 	}
@@ -169,8 +170,18 @@ func (a *App) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleCreateBinary(w http.ResponseWriter, r *http.Request, imagesOnly bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxUploadBytes+(2<<20))
-	if err := r.ParseMultipartForm(a.cfg.MaxUploadBytes + (1 << 20)); err != nil {
+	const multipartOverhead = 8 << 20
+
+	parseLimit := int64(32 << 20)
+	if a.cfg.MaxUploadBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxUploadBytes+multipartOverhead)
+		parseLimit = a.cfg.MaxUploadBytes + multipartOverhead
+	}
+	if err := r.ParseMultipartForm(parseLimit); err != nil {
+		if isRequestTooLarge(err) {
+			a.writeError(w, http.StatusRequestEntityTooLarge, errImageTooLarge)
+			return
+		}
 		a.writeError(w, http.StatusBadRequest, fmt.Errorf("parse upload: %w", err))
 		return
 	}
@@ -223,6 +234,9 @@ func (a *App) handleDownloadRecord(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := filepath.Join(a.cfg.ImagesDir, record.ContentBody)
+	if record.ContentType == "file" {
+		target = filepath.Join(a.cfg.FilesDir, record.ContentBody)
+	}
 	_, err = os.Stat(target)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -287,9 +301,9 @@ func (a *App) handleDeleteRecord(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if record.ContentType == "image" || record.ContentType == "file" {
-		target := filepath.Join(a.cfg.ImagesDir, record.ContentBody)
+		target := a.storagePath(record)
 		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-			a.logger.Printf("delete image %q: %v", target, err)
+			a.logger.Printf("delete file %q: %v", target, err)
 		}
 	}
 
@@ -355,54 +369,73 @@ var (
 )
 
 func (a *App) saveUploadedBinary(ctx context.Context, file multipart.File, header *multipart.FileHeader, imagesOnly bool) (Record, error) {
-	data, contentType, ext, err := readUploadPayload(file, a.cfg.MaxUploadBytes, imagesOnly)
-	if err != nil {
-		return Record{}, err
+	reader := bufio.NewReader(file)
+	sniff, err := reader.Peek(512)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
+		return Record{}, fmt.Errorf("read upload: %w", err)
 	}
+	if len(sniff) == 0 {
+		return Record{}, errEmptyFile
+	}
+
+	contentType := http.DetectContentType(sniff)
+	if imagesOnly && !strings.HasPrefix(contentType, "image/") {
+		return Record{}, errUnsupportedImage
+	}
+	ext := uploadExtension(contentType)
 
 	fileName := normalizedUploadName(header.Filename, ext)
 	name, err := generateFileName(ext)
 	if err != nil {
 		return Record{}, fmt.Errorf("generate image name: %w", err)
 	}
-	target := filepath.Join(a.cfg.ImagesDir, name)
-	if err := os.WriteFile(target, data, 0o644); err != nil {
+	target := a.storageTargetPath(contentType, name)
+	output, err := os.Create(target)
+	if err != nil {
 		return Record{}, fmt.Errorf("write image file: %w", err)
+	}
+	size, copyErr := io.Copy(output, reader)
+	closeErr := output.Close()
+	if copyErr != nil {
+		_ = os.Remove(target)
+		return Record{}, fmt.Errorf("write image file: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(target)
+		return Record{}, fmt.Errorf("close image file: %w", closeErr)
 	}
 
 	var record Record
 	if strings.HasPrefix(contentType, "image/") {
-		record, err = a.store.CreateImage(ctx, name, fileName, contentType, int64(len(data)))
+		record, err = a.store.CreateImage(ctx, name, fileName, contentType, size)
 	} else {
-		record, err = a.store.CreateFile(ctx, name, fileName, contentType, int64(len(data)))
+		record, err = a.store.CreateFile(ctx, name, fileName, contentType, size)
 	}
 	if err != nil {
-		os.Remove(target)
+		_ = os.Remove(target)
 		return Record{}, err
 	}
 
 	return record, nil
 }
 
-func readUploadPayload(reader io.Reader, maxBytes int64, imagesOnly bool) ([]byte, string, string, error) {
-	data, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
-	if err != nil {
-		return nil, "", "", fmt.Errorf("read upload: %w", err)
+func (a *App) storageTargetPath(contentType, name string) string {
+	if strings.HasPrefix(contentType, "image/") {
+		return filepath.Join(a.cfg.ImagesDir, name)
 	}
-	if int64(len(data)) > maxBytes {
-		return nil, "", "", errImageTooLarge
-	}
-	if len(data) == 0 {
-		return nil, "", "", errEmptyFile
-	}
+	return filepath.Join(a.cfg.FilesDir, name)
+}
 
-	contentType := http.DetectContentType(data)
-	if imagesOnly && !strings.HasPrefix(contentType, "image/") {
-		return nil, "", "", errUnsupportedImage
+func (a *App) storagePath(record Record) string {
+	if record.ContentType == "image" {
+		return filepath.Join(a.cfg.ImagesDir, record.ContentBody)
 	}
+	return filepath.Join(a.cfg.FilesDir, record.ContentBody)
+}
 
-	ext := uploadExtension(contentType)
-	return data, contentType, ext, nil
+func isRequestTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr) || strings.Contains(strings.ToLower(err.Error()), "request body too large")
 }
 
 func uploadExtension(contentType string) string {
@@ -475,8 +508,22 @@ func logRequests(next http.Handler, logger *log.Logger) http.Handler {
 		recorder.ResponseWriter = w
 		recorder.status = http.StatusOK
 		next.ServeHTTP(&recorder, r)
-		logger.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, recorder.status, time.Since(start).Round(time.Millisecond))
+		if shouldLogRequest(r, recorder.status) {
+			logger.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, recorder.status, time.Since(start).Round(time.Millisecond))
+		}
 	})
+}
+
+func shouldLogRequest(r *http.Request, status int) bool {
+	if status >= http.StatusBadRequest {
+		return true
+	}
+	switch r.Method {
+	case http.MethodPost, http.MethodPatch, http.MethodDelete, http.MethodPut:
+		return true
+	default:
+		return false
+	}
 }
 
 type responseRecorder struct {

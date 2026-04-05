@@ -12,7 +12,8 @@ const (
 	defaultDataDir        = "data"
 	defaultDatabaseName   = "localdrop.db"
 	defaultImagesDirName  = "images"
-	defaultMaxUploadBytes = 20 << 20
+	defaultFilesDirName   = "files"
+	defaultMaxUploadBytes = 0
 )
 
 type Config struct {
@@ -20,6 +21,7 @@ type Config struct {
 	DataDir        string
 	DBPath         string
 	ImagesDir      string
+	FilesDir       string
 	WebDevURL      string
 	MaxUploadBytes int64
 }
@@ -35,7 +37,7 @@ func LoadConfig() (Config, error) {
 	maxUploadBytes := int64(defaultMaxUploadBytes)
 	if raw := os.Getenv("LOCALDROP_MAX_UPLOAD_MB"); raw != "" {
 		value, err := strconv.Atoi(raw)
-		if err != nil || value <= 0 {
+		if err != nil || value < 0 {
 			return Config{}, fmt.Errorf("invalid LOCALDROP_MAX_UPLOAD_MB: %q", raw)
 		}
 		maxUploadBytes = int64(value) << 20
@@ -46,6 +48,7 @@ func LoadConfig() (Config, error) {
 		DataDir:        absDataDir,
 		DBPath:         filepath.Join(absDataDir, defaultDatabaseName),
 		ImagesDir:      filepath.Join(absDataDir, defaultImagesDirName),
+		FilesDir:       filepath.Join(absDataDir, defaultFilesDirName),
 		WebDevURL:      os.Getenv("LOCALDROP_WEB_DEV_URL"),
 		MaxUploadBytes: maxUploadBytes,
 	}, nil

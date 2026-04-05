@@ -69,6 +69,10 @@ func TestFileUploadAndDownload(t *testing.T) {
 	if fileRecord.FileName != "notes.txt" {
 		t.Fatalf("expected original file name to be kept, got %+v", fileRecord)
 	}
+	filePath := filepath.Join(app.cfg.FilesDir, fileRecord.ContentBody)
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("expected uploaded file to exist in files dir: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/records/"+itoa(fileRecord.ID)+"/download", nil)
 	recorder := httptest.NewRecorder()
@@ -146,6 +150,7 @@ func newTestApp(t *testing.T) *App {
 		DataDir:        root,
 		DBPath:         filepath.Join(root, "localdrop.db"),
 		ImagesDir:      filepath.Join(root, "images"),
+		FilesDir:       filepath.Join(root, "files"),
 		MaxUploadBytes: 5 << 20,
 	}
 

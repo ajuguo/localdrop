@@ -31,12 +31,14 @@ type StorageUsage struct {
 	TotalBytes int64 `json:"totalBytes"`
 	DBBytes    int64 `json:"dbBytes"`
 	ImageBytes int64 `json:"imageBytes"`
+	FileBytes  int64 `json:"fileBytes"`
 }
 
 type Store struct {
 	db        *sql.DB
 	dbPath    string
 	imagesDir string
+	filesDir  string
 }
 
 type imageCandidate struct {
@@ -44,12 +46,15 @@ type imageCandidate struct {
 	FileName string
 }
 
-func OpenStore(dbPath, imagesDir string) (*Store, error) {
+func OpenStore(dbPath, imagesDir, filesDir string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	if err := os.MkdirAll(imagesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create images dir: %w", err)
+	}
+	if err := os.MkdirAll(filesDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create files dir: %w", err)
 	}
 
 	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on", dbPath)
@@ -62,6 +67,7 @@ func OpenStore(dbPath, imagesDir string) (*Store, error) {
 		db:        db,
 		dbPath:    dbPath,
 		imagesDir: imagesDir,
+		filesDir:  filesDir,
 	}
 
 	if err := store.migrate(); err != nil {
@@ -346,11 +352,16 @@ func (s *Store) ComputeUsage() (StorageUsage, error) {
 	if err != nil {
 		return StorageUsage{}, fmt.Errorf("measure images dir: %w", err)
 	}
+	fileBytes, err := dirSize(s.filesDir)
+	if err != nil {
+		return StorageUsage{}, fmt.Errorf("measure files dir: %w", err)
+	}
 
 	return StorageUsage{
 		DBBytes:    dbBytes,
 		ImageBytes: imageBytes,
-		TotalBytes: dbBytes + imageBytes,
+		FileBytes:  fileBytes,
+		TotalBytes: dbBytes + imageBytes + fileBytes,
 	}, nil
 }
 
