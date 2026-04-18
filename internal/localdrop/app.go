@@ -69,7 +69,10 @@ func (a *App) routes() (http.Handler, error) {
 	mux.HandleFunc("POST /api/records/text", a.handleCreateText)
 	mux.HandleFunc("POST /api/records/image", a.handleCreateImage)
 	mux.HandleFunc("POST /api/records/file", a.handleCreateFile)
+	mux.HandleFunc("GET /api/bookmarks", a.handleListBookmarks)
+	mux.HandleFunc("POST /api/bookmarks/import", a.handleImportBookmarks)
 	mux.HandleFunc("GET /api/records/{id}/download", a.handleDownloadRecord)
+	mux.HandleFunc("PATCH /api/records/{id}/meta", a.handleUpdateRecordMeta)
 	mux.HandleFunc("PATCH /api/records/{id}/top", a.handleToggleTop)
 	mux.HandleFunc("DELETE /api/records/{id}", a.handleDeleteRecord)
 	mux.HandleFunc("GET /api/storage", a.handleStorage)
@@ -135,6 +138,25 @@ func (a *App) handleListRecords(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"records": records})
 }
 
+func (a *App) handleListBookmarks(w http.ResponseWriter, r *http.Request) {
+	bookmarks, err := a.store.ListBookmarks(r.Context())
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	syncedAt, err := bookmarkSyncTime(r.Context(), a.store.db)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]any{
+		"bookmarks": bookmarks,
+		"syncedAt":  syncedAt,
+	})
+}
+
 func (a *App) handleCreateText(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -167,6 +189,50 @@ func (a *App) handleCreateImage(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleCreateFile(w http.ResponseWriter, r *http.Request) {
 	a.handleCreateBinary(w, r, false)
+}
+
+func (a *App) handleImportBookmarks(w http.ResponseWriter, r *http.Request) {
+	const bookmarkImportLimit = 8 << 20
+
+	r.Body = http.MaxBytesReader(w, r.Body, bookmarkImportLimit)
+	if err := r.ParseMultipartForm(bookmarkImportLimit); err != nil {
+		if isRequestTooLarge(err) {
+			a.writeError(w, http.StatusRequestEntityTooLarge, errors.New("bookmark export is too large"))
+			return
+		}
+		a.writeError(w, http.StatusBadRequest, fmt.Errorf("parse bookmark upload: %w", err))
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, errors.New("bookmark html file is required"))
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, bookmarkImportLimit))
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, fmt.Errorf("read bookmark html: %w", err))
+		return
+	}
+
+	items, err := ParseBookmarksHTML(data)
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	importedCount, syncedAt, err := a.store.ReplaceBookmarks(r.Context(), items)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]any{
+		"importedCount": importedCount,
+		"syncedAt":      syncedAt,
+	})
 }
 
 func (a *App) handleCreateBinary(w http.ResponseWriter, r *http.Request, imagesOnly bool) {
@@ -277,6 +343,39 @@ func (a *App) handleToggleTop(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]any{"record": record})
+}
+
+func (a *App) handleUpdateRecordMeta(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		a.writeError(w, http.StatusBadRequest, errors.New("invalid record id"))
+		return
+	}
+
+	defer r.Body.Close()
+	var payload struct {
+		FileName *string   `json:"fileName"`
+		Tags     *[]string `json:"tags"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
+		a.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json: %w", err))
+		return
+	}
+
+	record, err := a.store.UpdateRecordMeta(r.Context(), id, payload.FileName, payload.Tags)
+	if err != nil {
+		switch {
+		case errors.Is(err, errRecordNotFound):
+			a.writeError(w, http.StatusNotFound, err)
+		case strings.Contains(err.Error(), "file name is required"), strings.Contains(err.Error(), "do not support file names"):
+			a.writeError(w, http.StatusBadRequest, err)
+		default:
+			a.writeError(w, http.StatusInternalServerError, err)
+		}
 		return
 	}
 

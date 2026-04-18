@@ -3,11 +3,13 @@ package localdrop
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -21,6 +23,7 @@ type Record struct {
 	ContentBody string     `json:"contentBody"`
 	FileName    string     `json:"fileName"`
 	MimeType    string     `json:"mimeType"`
+	Tags        []string   `json:"tags"`
 	IsTop       bool       `json:"isTop"`
 	TopAt       *time.Time `json:"topAt"`
 	FileSize    int64      `json:"fileSize"`
@@ -90,6 +93,7 @@ CREATE TABLE IF NOT EXISTS records (
     content_body TEXT NOT NULL,
     file_name TEXT NOT NULL DEFAULT '',
     mime_type TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
     is_top BOOLEAN NOT NULL DEFAULT 0,
     top_at DATETIME NULL,
     file_size INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +102,18 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE INDEX IF NOT EXISTS idx_records_feed
 ON records (is_top DESC, top_at DESC, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    folder_path TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_bookmarks_sort
+ON bookmarks (sort_order ASC, id ASC);
 `
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -134,6 +150,16 @@ ON records (is_top DESC, top_at DESC, created_at DESC, id DESC);
 		}
 	}
 
+	hasTags, err := s.hasColumn("records", "tags")
+	if err != nil {
+		return fmt.Errorf("check tags column: %w", err)
+	}
+	if !hasTags {
+		if _, err := s.db.Exec(`ALTER TABLE records ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return fmt.Errorf("add tags column: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -166,7 +192,7 @@ func (s *Store) hasColumn(table, column string) (bool, error) {
 
 func (s *Store) ListRecords(ctx context.Context) ([]Record, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, content_type, content_body, file_name, mime_type, is_top, top_at, file_size, created_at
+SELECT id, content_type, content_body, file_name, mime_type, tags, is_top, top_at, file_size, created_at
 FROM records
 ORDER BY is_top DESC, top_at IS NULL ASC, top_at DESC, created_at DESC, id DESC`)
 	if err != nil {
@@ -239,7 +265,7 @@ VALUES ('file', ?, ?, ?, ?, ?)`, relativePath, fileName, mimeType, size, now)
 
 func (s *Store) GetRecord(ctx context.Context, id int64) (Record, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, content_type, content_body, file_name, mime_type, is_top, top_at, file_size, created_at
+SELECT id, content_type, content_body, file_name, mime_type, tags, is_top, top_at, file_size, created_at
 FROM records WHERE id = ?`, id)
 
 	record, err := scanRecord(row)
@@ -269,6 +295,52 @@ WHERE id = ?`, isTop, topAt, id)
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return Record{}, fmt.Errorf("check top update: %w", err)
+	}
+	if affected == 0 {
+		return Record{}, errRecordNotFound
+	}
+
+	return s.GetRecord(ctx, id)
+}
+
+func (s *Store) UpdateRecordMeta(ctx context.Context, id int64, fileName *string, tags *[]string) (Record, error) {
+	record, err := s.GetRecord(ctx, id)
+	if err != nil {
+		return Record{}, err
+	}
+
+	nextFileName := record.FileName
+	if fileName != nil {
+		if record.ContentType == "text" {
+			return Record{}, errors.New("text records do not support file names")
+		}
+		nextFileName = normalizeDisplayName(*fileName)
+		if nextFileName == "" {
+			return Record{}, errors.New("file name is required")
+		}
+	}
+
+	nextTags := record.Tags
+	if tags != nil {
+		nextTags = normalizeTags(*tags)
+	}
+
+	tagsJSON, err := json.Marshal(nextTags)
+	if err != nil {
+		return Record{}, fmt.Errorf("encode tags: %w", err)
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+UPDATE records
+SET file_name = ?, tags = ?
+WHERE id = ?`, nextFileName, string(tagsJSON), id)
+	if err != nil {
+		return Record{}, fmt.Errorf("update record meta: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Record{}, fmt.Errorf("check meta update: %w", err)
 	}
 	if affected == 0 {
 		return Record{}, errRecordNotFound
@@ -408,6 +480,7 @@ type rowScanner interface {
 func scanRecord(scanner rowScanner) (Record, error) {
 	var (
 		record     Record
+		tagsRaw    string
 		topAtRaw   sql.NullTime
 		createdRaw time.Time
 	)
@@ -418,6 +491,7 @@ func scanRecord(scanner rowScanner) (Record, error) {
 		&record.ContentBody,
 		&record.FileName,
 		&record.MimeType,
+		&tagsRaw,
 		&record.IsTop,
 		&topAtRaw,
 		&record.FileSize,
@@ -428,10 +502,49 @@ func scanRecord(scanner rowScanner) (Record, error) {
 
 	createdAt := createdRaw.UTC()
 	record.CreatedAt = createdAt
+	record.Tags = decodeTags(tagsRaw)
 	if topAtRaw.Valid {
 		top := topAtRaw.Time.UTC()
 		record.TopAt = &top
 	}
 
 	return record, nil
+}
+
+func decodeTags(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return []string{}
+	}
+	return normalizeTags(tags)
+}
+
+func normalizeTags(tags []string) []string {
+	seen := make(map[string]struct{}, len(tags))
+	normalized := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		cleaned := strings.TrimSpace(tag)
+		if cleaned == "" {
+			continue
+		}
+		key := strings.ToLower(cleaned)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, cleaned)
+	}
+	return normalized
+}
+
+func normalizeDisplayName(name string) string {
+	base := strings.TrimSpace(filepath.Base(name))
+	if base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	return base
 }

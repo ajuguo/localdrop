@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 const records = ref([])
+const bookmarks = ref([])
 const storage = ref({
   totalBytes: 0,
   dbBytes: 0,
@@ -10,6 +11,7 @@ const storage = ref({
 })
 const loading = ref(true)
 const uploadingFile = ref(false)
+const importingBookmarks = ref(false)
 const cleaning = ref(false)
 const dragActive = ref(false)
 const notice = ref('')
@@ -17,11 +19,16 @@ const errorMessage = ref('')
 const previewRecord = ref(null)
 const activeModule = ref(null)
 const lastSyncedAt = ref(null)
+const bookmarkSyncedAt = ref(null)
 const filterQuery = ref('')
+const activeTagFilter = ref('')
 const textDraft = ref('')
+const renameDrafts = ref({})
+const tagDrafts = ref({})
 
 const fileInput = ref(null)
 const imageInput = ref(null)
+const bookmarkInput = ref(null)
 
 let pollTimer = null
 
@@ -29,6 +36,7 @@ const pinnedCount = computed(() => records.value.filter((item) => item.isTop).le
 const imageCount = computed(() => records.value.filter((item) => item.contentType === 'image').length)
 const fileCount = computed(() => records.value.filter((item) => item.contentType === 'file').length)
 const textCount = computed(() => records.value.filter((item) => item.contentType === 'text').length)
+const bookmarkCount = computed(() => bookmarks.value.length)
 const normalizedFilterQuery = computed(() => filterQuery.value.trim().toLowerCase())
 const filteredRecords = computed(() => {
   const keyword = normalizedFilterQuery.value
@@ -42,38 +50,72 @@ const filteredRecords = computed(() => {
     return fileLabel(record).toLowerCase().includes(keyword)
   })
 })
-const imageRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'image'))
-const fileRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'file'))
-const textRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'text'))
+const filteredBookmarks = computed(() => {
+  const keyword = normalizedFilterQuery.value
+  if (!keyword) {
+    return bookmarks.value
+  }
+  return bookmarks.value.filter((bookmark) =>
+    [bookmark.title, bookmark.url, bookmark.folderPath]
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword)
+  )
+})
+const imageBaseRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'image'))
+const fileBaseRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'file'))
+const textBaseRecords = computed(() => filteredRecords.value.filter((record) => record.contentType === 'text'))
+const imageRecords = computed(() => applyTagFilter(imageBaseRecords.value))
+const fileRecords = computed(() => applyTagFilter(fileBaseRecords.value))
+const textRecords = computed(() => applyTagFilter(textBaseRecords.value))
 const moduleCards = computed(() => [
+  {
+    id: 'bookmark',
+    label: 'Bookmarks',
+    title: '书签同步',
+    count: bookmarkCount.value,
+    detail: '导入浏览器书签并集中浏览'
+  },
   {
     id: 'image',
     label: 'Gallery',
     title: '图片相册',
-    count: imageRecords.value.length,
+    count: imageCount.value,
     detail: '平铺浏览并点击放大'
   },
   {
     id: 'file',
     label: 'Files',
     title: '文件列表',
-    count: fileRecords.value.length,
+    count: fileCount.value,
     detail: '直接下载并管理文件'
   },
   {
     id: 'text',
     label: 'Texts',
     title: '文本时间流',
-    count: textRecords.value.length,
+    count: textCount.value,
     detail: '按时间查看和复制文本'
   }
 ])
 const activeModuleMeta = computed(() => moduleCards.value.find((card) => card.id === activeModule.value) || null)
 const activeModuleRecords = computed(() => {
+  if (activeModule.value === 'bookmark') return filteredBookmarks.value
   if (activeModule.value === 'image') return imageRecords.value
   if (activeModule.value === 'file') return fileRecords.value
   if (activeModule.value === 'text') return textRecords.value
   return []
+})
+const activeModuleTags = computed(() => {
+  if (activeModule.value === 'bookmark') {
+    return []
+  }
+  let recordsForTags = []
+  if (activeModule.value === 'image') recordsForTags = imageBaseRecords.value
+  if (activeModule.value === 'file') recordsForTags = fileBaseRecords.value
+  if (activeModule.value === 'text') recordsForTags = textBaseRecords.value
+
+  return uniqueTags(recordsForTags)
 })
 
 const statCards = computed(() => [
@@ -93,8 +135,8 @@ const statCards = computed(() => [
     detail: '相册视图浏览与预览'
   },
   {
-    label: '文件数量',
-    value: `${fileCount.value}`,
+    label: '文件 / 书签',
+    value: `${fileCount.value} / ${bookmarkCount.value}`,
     detail: `${textCount.value} 条文本同步记录`
   }
 ])
@@ -138,13 +180,16 @@ async function refreshAll({ silent = false } = {}) {
     loading.value = true
   }
   try {
-    const [recordPayload, storagePayload] = await Promise.all([
+    const [recordPayload, storagePayload, bookmarkPayload] = await Promise.all([
       apiFetch('/api/records'),
-      apiFetch('/api/storage')
+      apiFetch('/api/storage'),
+      apiFetch('/api/bookmarks')
     ])
     records.value = recordPayload.records || []
     storage.value = storagePayload.storage || storage.value
+    bookmarks.value = bookmarkPayload.bookmarks || []
     lastSyncedAt.value = new Date()
+    bookmarkSyncedAt.value = bookmarkPayload.syncedAt ? new Date(bookmarkPayload.syncedAt) : null
     if (silent) {
       errorMessage.value = ''
     }
@@ -221,6 +266,10 @@ function openImageDialog() {
   imageInput.value?.click()
 }
 
+function openBookmarkDialog() {
+  bookmarkInput.value?.click()
+}
+
 function onDragEnter() {
   dragActive.value = true
 }
@@ -239,6 +288,36 @@ async function onDrop(event) {
   }
   await uploadBinaryBlob(file, file.name || `drop-${Date.now()}`)
   notice.value = file.type.startsWith('image/') ? '图片已通过拖拽上传' : '文件已通过拖拽上传'
+}
+
+async function handleBookmarkFile(event) {
+  const [file] = event.target.files || []
+  event.target.value = ''
+  if (!file) {
+    return
+  }
+  await uploadBookmarkFile(file)
+}
+
+async function uploadBookmarkFile(file) {
+  importingBookmarks.value = true
+  errorMessage.value = ''
+  try {
+    const formData = new FormData()
+    formData.append('file', file, file.name || 'bookmarks.html')
+    const payload = await apiFetch('/api/bookmarks/import', {
+      method: 'POST',
+      body: formData
+    })
+    await refreshAll({ silent: true })
+    notice.value = payload.importedCount
+      ? `已同步 ${payload.importedCount} 条浏览器书签`
+      : '书签已同步'
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    importingBookmarks.value = false
+  }
 }
 
 async function toggleTop(record) {
@@ -355,12 +434,115 @@ function clearFilter() {
 
 function openModule(moduleId) {
   filterQuery.value = ''
+  activeTagFilter.value = ''
   activeModule.value = moduleId
 }
 
 function closeModule() {
   activeModule.value = null
   filterQuery.value = ''
+  activeTagFilter.value = ''
+}
+
+async function updateRecordMeta(recordId, payload) {
+  await apiFetch(`/api/records/${recordId}/meta`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  })
+  await refreshAll({ silent: true })
+}
+
+async function renameBinaryRecord(record) {
+  const nextName = (renameDrafts.value[record.id] || '').trim()
+  if (!nextName || nextName === fileLabel(record)) {
+    return
+  }
+
+  errorMessage.value = ''
+  try {
+    await updateRecordMeta(record.id, { fileName: nextName })
+    renameDrafts.value = {
+      ...renameDrafts.value,
+      [record.id]: nextName
+    }
+    notice.value = '名称已更新'
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
+async function addTag(record) {
+  const nextTag = (tagDrafts.value[record.id] || '').trim()
+  if (!nextTag) {
+    return
+  }
+
+  const tags = uniqueTagValues([...(record.tags || []), nextTag])
+  errorMessage.value = ''
+  try {
+    await updateRecordMeta(record.id, { tags })
+    tagDrafts.value = {
+      ...tagDrafts.value,
+      [record.id]: ''
+    }
+    notice.value = '标签已更新'
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
+async function removeTag(record, tag) {
+  const tags = (record.tags || []).filter((item) => item !== tag)
+  errorMessage.value = ''
+  try {
+    await updateRecordMeta(record.id, { tags })
+    notice.value = '标签已移除'
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
+function onRenameDraftFocus(record) {
+  renameDrafts.value = {
+    ...renameDrafts.value,
+    [record.id]: fileLabel(record)
+  }
+}
+
+function toggleTagFilter(tag) {
+  activeTagFilter.value = activeTagFilter.value === tag ? '' : tag
+}
+
+function applyTagFilter(records) {
+  if (!activeTagFilter.value) {
+    return records
+  }
+  return records.filter((record) => (record.tags || []).includes(activeTagFilter.value))
+}
+
+function uniqueTags(records) {
+  return uniqueTagValues(records.flatMap((record) => record.tags || []))
+}
+
+function uniqueTagValues(tags) {
+  const seen = new Set()
+  const result = []
+  for (const rawTag of tags) {
+    const tag = `${rawTag || ''}`.trim()
+    if (!tag) {
+      continue
+    }
+    const key = tag.toLowerCase()
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    result.push(tag)
+  }
+  return result
 }
 
 function formatBytes(bytes) {
@@ -431,7 +613,7 @@ function formatTimestamp(value) {
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Control Deck</p>
                 <h2 class="mt-2 text-2xl font-semibold text-slate-50">同步入口</h2>
                 <p class="mt-2 text-sm leading-6 text-slate-400">
-                  直接输入文本并写入文本分组。图片和常见文件仍然可以通过选择文件或拖拽上传。
+                  直接输入文本、上传文件，或导入浏览器导出的书签 HTML。导入后的书签会单独保存，并在书签模块中统一浏览。
                 </p>
               </div>
               <button
@@ -452,6 +634,17 @@ function formatTimestamp(value) {
                 <span class="block text-xs uppercase tracking-[0.3em] text-cyan-100/70">Upload</span>
                 <span class="mt-2 block text-lg font-semibold">
                   {{ uploadingFile ? '上传中...' : '选择图片文件' }}
+                </span>
+              </button>
+
+              <button
+                class="rounded-[22px] border border-sky-300/20 bg-sky-300/10 px-5 py-4 text-left text-sky-50 transition hover:bg-sky-300/20 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="importingBookmarks"
+                @click="openBookmarkDialog"
+              >
+                <span class="block text-xs uppercase tracking-[0.3em] text-sky-100/70">Bookmarks</span>
+                <span class="mt-2 block text-lg font-semibold">
+                  {{ importingBookmarks ? '同步中...' : '导入书签 HTML' }}
                 </span>
               </button>
 
@@ -488,6 +681,7 @@ function formatTimestamp(value) {
 
             <input ref="imageInput" type="file" accept="image/*" class="hidden" @change="handleSelectedFile" />
             <input ref="fileInput" type="file" class="hidden" @change="handleSelectedFile" />
+            <input ref="bookmarkInput" type="file" accept=".html,text/html" class="hidden" @change="handleBookmarkFile" />
 
             <div
               class="mt-4 rounded-[24px] border border-dashed px-5 py-6 text-center transition"
@@ -516,6 +710,9 @@ function formatTimestamp(value) {
             <p v-if="lastSyncedAt" class="mt-3 text-sm text-slate-400">
               最近刷新: {{ formatTimestamp(lastSyncedAt) }}
             </p>
+            <p v-if="bookmarkSyncedAt" class="mt-2 text-sm text-slate-400">
+              书签最近同步: {{ formatTimestamp(bookmarkSyncedAt) }}
+            </p>
           </article>
         </div>
 
@@ -538,7 +735,7 @@ function formatTimestamp(value) {
             正在加载 LocalDrop 内容...
           </div>
 
-          <div v-else class="mt-6 grid gap-3 sm:grid-cols-3">
+          <div v-else class="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             <button
               v-for="card in moduleCards"
               :key="card.id"
@@ -586,7 +783,7 @@ function formatTimestamp(value) {
                     v-model="filterQuery"
                     type="text"
                     class="min-w-0 flex-1 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500 sm:min-w-[14rem]"
-                    placeholder="过滤文本或文件名"
+                    placeholder="过滤标题、链接或文件名"
                   />
                   <button
                     v-if="filterQuery"
@@ -603,6 +800,24 @@ function formatTimestamp(value) {
                   关闭
                 </button>
               </div>
+            </div>
+            <div v-if="activeModuleTags.length" class="mt-4 flex flex-wrap items-center gap-2">
+              <button
+                class="rounded-full border px-3 py-1 text-xs transition"
+                :class="activeTagFilter ? 'border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]' : 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100'"
+                @click="activeTagFilter = ''"
+              >
+                全部标签
+              </button>
+              <button
+                v-for="tag in activeModuleTags"
+                :key="tag"
+                class="rounded-full border px-3 py-1 text-xs transition"
+                :class="activeTagFilter === tag ? 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100' : 'border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]'"
+                @click="toggleTagFilter(tag)"
+              >
+                #{{ tag }}
+              </button>
             </div>
           </div>
 
@@ -637,6 +852,52 @@ function formatTimestamp(value) {
                   <div class="flex flex-wrap items-center gap-2 p-3 text-xs text-slate-400">
                     <span>{{ formatBytes(record.fileSize) }}</span>
                     <span class="truncate">{{ fileLabel(record) }}</span>
+                  </div>
+                  <div class="px-3">
+                    <label class="text-[11px] uppercase tracking-[0.22em] text-slate-500">名称</label>
+                    <div class="mt-2 flex gap-2">
+                      <input
+                        v-model="renameDrafts[record.id]"
+                        type="text"
+                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                        :placeholder="fileLabel(record)"
+                        @focus="onRenameDraftFocus(record)"
+                        @keyup.enter="renameBinaryRecord(record)"
+                      />
+                      <button
+                        class="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition hover:bg-white/10"
+                        @click="renameBinaryRecord(record)"
+                      >
+                        改名
+                      </button>
+                    </div>
+                  </div>
+                  <div class="px-3 pt-3">
+                    <div class="flex flex-wrap gap-2">
+                      <button
+                        v-for="tag in record.tags || []"
+                        :key="tag"
+                        class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
+                        @click="removeTag(record, tag)"
+                      >
+                        #{{ tag }} ×
+                      </button>
+                    </div>
+                    <div class="mt-2 flex gap-2">
+                      <input
+                        v-model="tagDrafts[record.id]"
+                        type="text"
+                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                        placeholder="添加标签"
+                        @keyup.enter="addTag(record)"
+                      />
+                      <button
+                        class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
+                        @click="addTag(record)"
+                      >
+                        添加
+                      </button>
+                    </div>
                   </div>
                   <div class="flex flex-wrap gap-2 px-3 pb-3">
                     <button
@@ -695,6 +956,51 @@ function formatTimestamp(value) {
                     </div>
                   </div>
 
+                  <div class="mt-4">
+                    <label class="text-[11px] uppercase tracking-[0.22em] text-slate-500">名称</label>
+                    <div class="mt-2 flex gap-2">
+                      <input
+                        v-model="renameDrafts[record.id]"
+                        type="text"
+                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                        :placeholder="fileLabel(record)"
+                        @focus="onRenameDraftFocus(record)"
+                        @keyup.enter="renameBinaryRecord(record)"
+                      />
+                      <button
+                        class="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition hover:bg-white/10"
+                        @click="renameBinaryRecord(record)"
+                      >
+                        改名
+                      </button>
+                    </div>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <button
+                        v-for="tag in record.tags || []"
+                        :key="tag"
+                        class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
+                        @click="removeTag(record, tag)"
+                      >
+                        #{{ tag }} ×
+                      </button>
+                    </div>
+                    <div class="mt-2 flex gap-2">
+                      <input
+                        v-model="tagDrafts[record.id]"
+                        type="text"
+                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                        placeholder="添加标签"
+                        @keyup.enter="addTag(record)"
+                      />
+                      <button
+                        class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
+                        @click="addTag(record)"
+                      >
+                        添加
+                      </button>
+                    </div>
+                  </div>
+
                   <div class="mt-4 flex flex-wrap gap-2">
                     <button
                       class="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-100 transition hover:bg-white/10"
@@ -722,6 +1028,56 @@ function formatTimestamp(value) {
               </div>
             </div>
 
+            <div v-else-if="activeModule === 'bookmark'">
+              <div v-if="activeModuleRecords.length" class="grid gap-4 xl:grid-cols-2">
+                <article
+                  v-for="bookmark in activeModuleRecords"
+                  :key="bookmark.id"
+                  class="animate-rise rounded-[24px] border border-white/10 bg-white/[0.03] p-4 transition hover:-translate-y-0.5"
+                >
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="rounded-full border border-sky-300/20 bg-sky-300/10 px-3 py-1 text-xs uppercase tracking-[0.25em] text-sky-100">
+                      bookmark
+                    </span>
+                    <span v-if="bookmark.folderPath" class="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-xs text-slate-300">
+                      {{ bookmark.folderPath }}
+                    </span>
+                  </div>
+
+                  <a
+                    :href="bookmark.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="mt-4 block text-lg font-semibold text-slate-50 transition hover:text-sky-200"
+                  >
+                    {{ bookmark.title }}
+                  </a>
+                  <p class="mt-2 break-all text-sm leading-6 text-slate-400">
+                    {{ bookmark.url }}
+                  </p>
+
+                  <div class="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                    <span>顺序 {{ bookmark.sortOrder + 1 }}</span>
+                    <span>{{ formatTimestamp(bookmark.createdAt) }}</span>
+                  </div>
+
+                  <div class="mt-4">
+                    <a
+                      :href="bookmark.url"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="inline-flex rounded-full border border-sky-300/20 bg-sky-300/10 px-4 py-2 text-sm text-sky-100 transition hover:bg-sky-300/20"
+                    >
+                      新窗口打开
+                    </a>
+                  </div>
+                </article>
+              </div>
+              <div v-else class="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-12 text-center text-sm text-slate-400">
+                还没有匹配的书签记录。
+              </div>
+            </div>
+
             <div v-else>
               <div v-if="activeModuleRecords.length" class="space-y-4">
                 <article
@@ -745,6 +1101,32 @@ function formatTimestamp(value) {
 
                   <div class="mt-4 whitespace-pre-wrap break-words text-sm leading-7 text-slate-100 sm:text-base">
                     {{ record.contentBody }}
+                  </div>
+
+                  <div class="mt-4 flex flex-wrap gap-2">
+                    <button
+                      v-for="tag in record.tags || []"
+                      :key="tag"
+                      class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
+                      @click="removeTag(record, tag)"
+                    >
+                      #{{ tag }} ×
+                    </button>
+                  </div>
+                  <div class="mt-2 flex gap-2">
+                    <input
+                      v-model="tagDrafts[record.id]"
+                      type="text"
+                      class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                      placeholder="添加标签"
+                      @keyup.enter="addTag(record)"
+                    />
+                    <button
+                      class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
+                      @click="addTag(record)"
+                    >
+                      添加
+                    </button>
                   </div>
 
                   <div class="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-400">
