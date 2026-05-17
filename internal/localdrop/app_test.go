@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -227,6 +228,89 @@ func TestImportBookmarksReplacesExistingSet(t *testing.T) {
 	}
 }
 
+func TestBingWallpaperCachesLocallyByDay(t *testing.T) {
+	app := newTestApp(t)
+
+	var imageHits atomic.Int32
+	var apiHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/HPImageArchive.aspx":
+			apiHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"images":[{"url":"/assets/daily.jpg","title":"Daily","copyright":"Bing Test","copyrightlink":"/search?q=test","startdate":"`+time.Now().UTC().Format("20060102")+`"}]}`)
+		case "/assets/daily.jpg":
+			imageHits.Add(1)
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("fake-jpeg-data"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	app.bingAPIURL = server.URL + "/HPImageArchive.aspx"
+	app.bingBaseURL = server.URL
+	app.httpClient = server.Client()
+
+	first := callJSON[struct {
+		Wallpaper struct {
+			ImageURL string `json:"imageUrl"`
+			Date     string `json:"date"`
+		} `json:"wallpaper"`
+	}](t, app.Handler(), http.MethodGet, "/api/wallpaper/bing", "", nil)
+
+	if first.Wallpaper.ImageURL == "" {
+		t.Fatal("expected wallpaper image url")
+	}
+	if apiHits.Load() != 1 || imageHits.Load() != 1 {
+		t.Fatalf("expected first request to hit remote once, api=%d image=%d", apiHits.Load(), imageHits.Load())
+	}
+
+	imagePath := filepath.Join(app.cfg.WallpapersDir, strings.TrimPrefix(first.Wallpaper.ImageURL, "/wallpapers/"))
+	if _, err := os.Stat(imagePath); err != nil {
+		t.Fatalf("expected wallpaper file to be cached locally: %v", err)
+	}
+
+	second := callJSON[struct {
+		Wallpaper struct {
+			ImageURL string `json:"imageUrl"`
+		} `json:"wallpaper"`
+	}](t, app.Handler(), http.MethodGet, "/api/wallpaper/bing", "", nil)
+
+	if second.Wallpaper.ImageURL != first.Wallpaper.ImageURL {
+		t.Fatalf("expected cached wallpaper url to stay stable, first=%q second=%q", first.Wallpaper.ImageURL, second.Wallpaper.ImageURL)
+	}
+	if apiHits.Load() != 1 || imageHits.Load() != 1 {
+		t.Fatalf("expected cached request to avoid remote fetch, api=%d image=%d", apiHits.Load(), imageHits.Load())
+	}
+}
+
+func TestUISettingsPersistAcrossRequests(t *testing.T) {
+	app := newTestApp(t)
+
+	initial := callJSON[struct {
+		Settings UISettings `json:"settings"`
+	}](t, app.Handler(), http.MethodGet, "/api/settings/ui", "", nil)
+	if initial.Settings.PanelOpacity != 88 {
+		t.Fatalf("expected default panel opacity 88, got %+v", initial.Settings)
+	}
+
+	updated := callJSON[struct {
+		Settings UISettings `json:"settings"`
+	}](t, app.Handler(), http.MethodPatch, "/api/settings/ui", "application/json", strings.NewReader(`{"panelOpacity":72}`))
+	if updated.Settings.PanelOpacity != 72 {
+		t.Fatalf("expected saved panel opacity 72, got %+v", updated.Settings)
+	}
+
+	reloaded := callJSON[struct {
+		Settings UISettings `json:"settings"`
+	}](t, app.Handler(), http.MethodGet, "/api/settings/ui", "", nil)
+	if reloaded.Settings.PanelOpacity != 72 {
+		t.Fatalf("expected persisted panel opacity 72, got %+v", reloaded.Settings)
+	}
+}
+
 func newTestApp(t *testing.T) *App {
 	t.Helper()
 
@@ -237,6 +321,7 @@ func newTestApp(t *testing.T) *App {
 		DBPath:         filepath.Join(root, "localdrop.db"),
 		ImagesDir:      filepath.Join(root, "images"),
 		FilesDir:       filepath.Join(root, "files"),
+		WallpapersDir:  filepath.Join(root, "wallpapers"),
 		MaxUploadBytes: 5 << 20,
 	}
 

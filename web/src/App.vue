@@ -7,7 +7,8 @@ const storage = ref({
   totalBytes: 0,
   dbBytes: 0,
   imageBytes: 0,
-  fileBytes: 0
+  fileBytes: 0,
+  wallpaperBytes: 0
 })
 const loading = ref(true)
 const uploadingFile = ref(false)
@@ -25,12 +26,23 @@ const activeTagFilter = ref('')
 const textDraft = ref('')
 const renameDrafts = ref({})
 const tagDrafts = ref({})
+const wallpaper = ref({
+  imageUrl: '',
+  title: '',
+  copyright: '',
+  copyrightLink: '',
+  date: ''
+})
+const wallpaperState = ref('idle')
+const panelOpacity = ref(88)
 
 const fileInput = ref(null)
 const imageInput = ref(null)
 const bookmarkInput = ref(null)
 
 let pollTimer = null
+let wallpaperTimer = null
+let panelOpacityTimer = null
 
 const pinnedCount = computed(() => records.value.filter((item) => item.isTop).length)
 const imageCount = computed(() => records.value.filter((item) => item.contentType === 'image').length)
@@ -40,9 +52,7 @@ const bookmarkCount = computed(() => bookmarks.value.length)
 const normalizedFilterQuery = computed(() => filterQuery.value.trim().toLowerCase())
 const filteredRecords = computed(() => {
   const keyword = normalizedFilterQuery.value
-  if (!keyword) {
-    return records.value
-  }
+  if (!keyword) return records.value
   return records.value.filter((record) => {
     if (record.contentType === 'text') {
       return (record.contentBody || '').toLowerCase().includes(keyword)
@@ -52,9 +62,7 @@ const filteredRecords = computed(() => {
 })
 const filteredBookmarks = computed(() => {
   const keyword = normalizedFilterQuery.value
-  if (!keyword) {
-    return bookmarks.value
-  }
+  if (!keyword) return bookmarks.value
   return bookmarks.value.filter((bookmark) =>
     [bookmark.title, bookmark.url, bookmark.folderPath]
       .join(' ')
@@ -71,31 +79,35 @@ const textRecords = computed(() => applyTagFilter(textBaseRecords.value))
 const moduleCards = computed(() => [
   {
     id: 'bookmark',
-    label: 'Bookmarks',
-    title: '书签同步',
+    label: 'BOOKMARKS',
+    title: '书签图鉴',
     count: bookmarkCount.value,
-    detail: '导入浏览器书签并集中浏览'
+    detail: '导入浏览器书签并集中检索',
+    tone: 'sky'
   },
   {
     id: 'image',
-    label: 'Gallery',
-    title: '图片相册',
+    label: 'GALLERY',
+    title: '像素画廊',
     count: imageCount.value,
-    detail: '平铺浏览并点击放大'
+    detail: '平铺浏览图片并放大预览',
+    tone: 'mint'
   },
   {
     id: 'file',
-    label: 'Files',
-    title: '文件列表',
+    label: 'FILES',
+    title: '文件仓',
     count: fileCount.value,
-    detail: '直接下载并管理文件'
+    detail: '下载、改名、打标签、置顶',
+    tone: 'amber'
   },
   {
     id: 'text',
-    label: 'Texts',
-    title: '文本时间流',
+    label: 'TEXTS',
+    title: '文本栈',
     count: textCount.value,
-    detail: '按时间查看和复制文本'
+    detail: '记录短文本、链接和临时备注',
+    tone: 'rose'
   }
 ])
 const activeModuleMeta = computed(() => moduleCards.value.find((card) => card.id === activeModule.value) || null)
@@ -107,52 +119,64 @@ const activeModuleRecords = computed(() => {
   return []
 })
 const activeModuleTags = computed(() => {
-  if (activeModule.value === 'bookmark') {
-    return []
-  }
+  if (activeModule.value === 'bookmark') return []
   let recordsForTags = []
   if (activeModule.value === 'image') recordsForTags = imageBaseRecords.value
   if (activeModule.value === 'file') recordsForTags = fileBaseRecords.value
   if (activeModule.value === 'text') recordsForTags = textBaseRecords.value
-
   return uniqueTags(recordsForTags)
 })
-
+const wallpaperStyle = computed(() => ({
+  '--bing-wallpaper': wallpaper.value.imageUrl ? `url("${wallpaper.value.imageUrl}")` : 'none',
+  '--island-panel-alpha': `${(panelOpacity.value / 100).toFixed(2)}`,
+  '--island-panel-strong-alpha': `${Math.min(panelOpacity.value / 100 + 0.06, 0.98).toFixed(2)}`
+}))
+const wallpaperAttributionUrl = computed(() => {
+  const value = wallpaper.value.copyrightLink || ''
+  if (!value) return ''
+  if (value.startsWith('http://') || value.startsWith('https://')) return value
+  return `https://www.bing.com${value}`
+})
 const statCards = computed(() => [
   {
-    label: '当前占用',
+    label: 'MEMORY',
     value: formatBytes(storage.value.totalBytes),
-    detail: `${formatBytes(storage.value.imageBytes)} images + ${formatBytes(storage.value.fileBytes)} files + ${formatBytes(storage.value.dbBytes)} db`
+    detail: `${formatBytes(storage.value.imageBytes)} IMG / ${formatBytes(storage.value.fileBytes)} FILE / ${formatBytes(storage.value.wallpaperBytes)} WALL / ${formatBytes(storage.value.dbBytes)} DB`
   },
   {
-    label: '置顶消息',
+    label: 'PINNED',
     value: `${pinnedCount.value}`,
-    detail: '在各自分组内优先显示'
+    detail: '置顶记录会优先显示在模块顶部'
   },
   {
-    label: '图片数量',
-    value: `${imageCount.value}`,
-    detail: '相册视图浏览与预览'
+    label: 'SYNC',
+    value: `${imageCount.value + fileCount.value + textCount.value}`,
+    detail: `${bookmarkCount.value} 条书签同步记录已归档`
   },
   {
-    label: '文件 / 书签',
-    value: `${fileCount.value} / ${bookmarkCount.value}`,
-    detail: `${textCount.value} 条文本同步记录`
+    label: 'POLL',
+    value: '03s',
+    detail: '前端按 3 秒节奏轮询服务端'
   }
 ])
 
 onMounted(() => {
+  void fetchUISettings()
   void refreshAll()
+  void fetchBingWallpaper()
   pollTimer = window.setInterval(() => {
     void refreshAll({ silent: true })
   }, 3000)
+  wallpaperTimer = window.setInterval(() => {
+    void fetchBingWallpaper({ silent: true })
+  }, 60 * 60 * 1000)
   window.addEventListener('keydown', onKeydown)
 })
 
 onBeforeUnmount(() => {
-  if (pollTimer) {
-    window.clearInterval(pollTimer)
-  }
+  if (pollTimer) window.clearInterval(pollTimer)
+  if (wallpaperTimer) window.clearInterval(wallpaperTimer)
+  if (panelOpacityTimer) window.clearTimeout(panelOpacityTimer)
   window.removeEventListener('keydown', onKeydown)
 })
 
@@ -176,9 +200,7 @@ async function apiFetch(url, options = {}) {
 }
 
 async function refreshAll({ silent = false } = {}) {
-  if (!silent) {
-    loading.value = true
-  }
+  if (!silent) loading.value = true
   try {
     const [recordPayload, storagePayload, bookmarkPayload] = await Promise.all([
       apiFetch('/api/records'),
@@ -190,24 +212,96 @@ async function refreshAll({ silent = false } = {}) {
     bookmarks.value = bookmarkPayload.bookmarks || []
     lastSyncedAt.value = new Date()
     bookmarkSyncedAt.value = bookmarkPayload.syncedAt ? new Date(bookmarkPayload.syncedAt) : null
-    if (silent) {
-      errorMessage.value = ''
-    }
+    if (silent) errorMessage.value = ''
   } catch (error) {
     errorMessage.value = error.message
   } finally {
-    if (!silent) {
-      loading.value = false
+    if (!silent) loading.value = false
+  }
+}
+
+async function fetchBingWallpaper({ silent = false } = {}) {
+  if (!silent) wallpaperState.value = 'loading'
+  try {
+    const payload = await apiFetch('/api/wallpaper/bing')
+    if (payload.wallpaper?.imageUrl) {
+      wallpaper.value = {
+        imageUrl: payload.wallpaper.imageUrl,
+        title: payload.wallpaper.title || 'Bing Daily Wallpaper',
+        copyright: payload.wallpaper.copyright || '',
+        copyrightLink: payload.wallpaper.copyrightLink || '',
+        date: payload.wallpaper.date || ''
+      }
+      wallpaperState.value = 'ready'
+    } else if (!silent) {
+      wallpaperState.value = 'error'
     }
+  } catch (error) {
+    if (!silent) {
+      wallpaperState.value = 'error'
+      errorMessage.value = error.message
+    }
+  }
+}
+
+async function fetchUISettings() {
+  try {
+    const payload = await apiFetch('/api/settings/ui')
+    if (typeof payload.settings?.panelOpacity === 'number') {
+      panelOpacity.value = payload.settings.panelOpacity
+    }
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
+function updatePanelOpacity(value) {
+  const numeric = Number.parseInt(value, 10)
+  if (Number.isNaN(numeric)) return
+  panelOpacity.value = Math.min(100, Math.max(35, numeric))
+  if (panelOpacityTimer) window.clearTimeout(panelOpacityTimer)
+  panelOpacityTimer = window.setTimeout(() => {
+    void saveUISettings()
+  }, 180)
+}
+
+async function refreshWallpaperNow() {
+  await apiFetch('/api/wallpaper/bing?refresh=1').then((payload) => {
+    if (payload.wallpaper?.imageUrl) {
+      wallpaper.value = {
+        imageUrl: payload.wallpaper.imageUrl,
+        title: payload.wallpaper.title || 'Bing Daily Wallpaper',
+        copyright: payload.wallpaper.copyright || '',
+        copyrightLink: payload.wallpaper.copyrightLink || '',
+        date: payload.wallpaper.date || ''
+      }
+      wallpaperState.value = 'ready'
+    }
+  }).catch((error) => {
+    wallpaperState.value = 'error'
+    errorMessage.value = error.message
+  })
+}
+
+async function saveUISettings() {
+  try {
+    const payload = await apiFetch('/api/settings/ui', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ panelOpacity: panelOpacity.value })
+    })
+    if (typeof payload.settings?.panelOpacity === 'number') {
+      panelOpacity.value = payload.settings.panelOpacity
+    }
+  } catch (error) {
+    errorMessage.value = error.message
   }
 }
 
 async function uploadText(content) {
   await apiFetch('/api/records/text', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content })
   })
   await refreshAll({ silent: true })
@@ -251,9 +345,7 @@ async function uploadBinaryBlob(blob, filename, endpoint = '/api/records/file') 
 async function handleSelectedFile(event) {
   const [file] = event.target.files || []
   event.target.value = ''
-  if (!file) {
-    return
-  }
+  if (!file) return
   await uploadBinaryBlob(file, file.name || `upload-${Date.now()}`)
   notice.value = file.type.startsWith('image/') ? '图片已上传' : '文件已上传'
 }
@@ -275,17 +367,13 @@ function onDragEnter() {
 }
 
 function onDragLeave(event) {
-  if (event.currentTarget === event.target) {
-    dragActive.value = false
-  }
+  if (event.currentTarget === event.target) dragActive.value = false
 }
 
 async function onDrop(event) {
   dragActive.value = false
   const [file] = event.dataTransfer?.files || []
-  if (!file) {
-    return
-  }
+  if (!file) return
   await uploadBinaryBlob(file, file.name || `drop-${Date.now()}`)
   notice.value = file.type.startsWith('image/') ? '图片已通过拖拽上传' : '文件已通过拖拽上传'
 }
@@ -293,9 +381,7 @@ async function onDrop(event) {
 async function handleBookmarkFile(event) {
   const [file] = event.target.files || []
   event.target.value = ''
-  if (!file) {
-    return
-  }
+  if (!file) return
   await uploadBookmarkFile(file)
 }
 
@@ -310,9 +396,7 @@ async function uploadBookmarkFile(file) {
       body: formData
     })
     await refreshAll({ silent: true })
-    notice.value = payload.importedCount
-      ? `已同步 ${payload.importedCount} 条浏览器书签`
-      : '书签已同步'
+    notice.value = payload.importedCount ? `已同步 ${payload.importedCount} 条浏览器书签` : '书签已同步'
   } catch (error) {
     errorMessage.value = error.message
   } finally {
@@ -325,12 +409,8 @@ async function toggleTop(record) {
   try {
     await apiFetch(`/api/records/${record.id}/top`, {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        isTop: !record.isTop
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isTop: !record.isTop })
     })
     notice.value = record.isTop ? '已取消置顶' : '已在当前分组置顶'
     await refreshAll({ silent: true })
@@ -343,15 +423,11 @@ async function deleteRecord(record) {
   const confirmed = window.confirm(record.contentType === 'text'
     ? '确定删除这条文本记录吗？'
     : '删除后会同时移除服务器上的原始文件，确定继续吗？')
-  if (!confirmed) {
-    return
-  }
+  if (!confirmed) return
 
   errorMessage.value = ''
   try {
-    await apiFetch(`/api/records/${record.id}`, {
-      method: 'DELETE'
-    })
+    await apiFetch(`/api/records/${record.id}`, { method: 'DELETE' })
     notice.value = '记录已删除'
     await refreshAll({ silent: true })
   } catch (error) {
@@ -361,16 +437,12 @@ async function deleteRecord(record) {
 
 async function cleanupOldImages() {
   const confirmed = window.confirm('将删除 7 天前的图片记录及原始图片文件，但保留普通文件和所有文本记录。确定继续吗？')
-  if (!confirmed) {
-    return
-  }
+  if (!confirmed) return
 
   cleaning.value = true
   errorMessage.value = ''
   try {
-    const payload = await apiFetch('/api/cleanup/old-images', {
-      method: 'POST'
-    })
+    const payload = await apiFetch('/api/cleanup/old-images', { method: 'POST' })
     storage.value = payload.storage || storage.value
     notice.value = payload.deletedCount ? `已清理 ${payload.deletedCount} 张旧图片` : '没有可清理的旧图片'
     await refreshAll({ silent: true })
@@ -389,7 +461,7 @@ async function copyText(value) {
       fallbackCopy(value)
     }
     notice.value = '文本已复制'
-  } catch (error) {
+  } catch {
     fallbackCopy(value)
     notice.value = '文本已复制'
   }
@@ -422,9 +494,7 @@ function fileLabel(record) {
 function fileExtension(record) {
   const label = fileLabel(record)
   const parts = label.split('.')
-  if (parts.length < 2) {
-    return 'FILE'
-  }
+  if (parts.length < 2) return 'FILE'
   return parts.at(-1).slice(0, 6).toUpperCase()
 }
 
@@ -447,9 +517,7 @@ function closeModule() {
 async function updateRecordMeta(recordId, payload) {
   await apiFetch(`/api/records/${recordId}/meta`, {
     method: 'PATCH',
-    headers: {
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   await refreshAll({ silent: true })
@@ -457,9 +525,7 @@ async function updateRecordMeta(recordId, payload) {
 
 async function renameBinaryRecord(record) {
   const nextName = (renameDrafts.value[record.id] || '').trim()
-  if (!nextName || nextName === fileLabel(record)) {
-    return
-  }
+  if (!nextName || nextName === fileLabel(record)) return
 
   errorMessage.value = ''
   try {
@@ -476,9 +542,7 @@ async function renameBinaryRecord(record) {
 
 async function addTag(record) {
   const nextTag = (tagDrafts.value[record.id] || '').trim()
-  if (!nextTag) {
-    return
-  }
+  if (!nextTag) return
 
   const tags = uniqueTagValues([...(record.tags || []), nextTag])
   errorMessage.value = ''
@@ -516,15 +580,13 @@ function toggleTagFilter(tag) {
   activeTagFilter.value = activeTagFilter.value === tag ? '' : tag
 }
 
-function applyTagFilter(records) {
-  if (!activeTagFilter.value) {
-    return records
-  }
-  return records.filter((record) => (record.tags || []).includes(activeTagFilter.value))
+function applyTagFilter(items) {
+  if (!activeTagFilter.value) return items
+  return items.filter((record) => (record.tags || []).includes(activeTagFilter.value))
 }
 
-function uniqueTags(records) {
-  return uniqueTagValues(records.flatMap((record) => record.tags || []))
+function uniqueTags(items) {
+  return uniqueTagValues(items.flatMap((record) => record.tags || []))
 }
 
 function uniqueTagValues(tags) {
@@ -532,13 +594,9 @@ function uniqueTagValues(tags) {
   const result = []
   for (const rawTag of tags) {
     const tag = `${rawTag || ''}`.trim()
-    if (!tag) {
-      continue
-    }
+    if (!tag) continue
     const key = tag.toLowerCase()
-    if (seen.has(key)) {
-      continue
-    }
+    if (seen.has(key)) continue
     seen.add(key)
     result.push(tag)
   }
@@ -546,9 +604,7 @@ function uniqueTagValues(tags) {
 }
 
 function formatBytes(bytes) {
-  if (!bytes) {
-    return '0 B'
-  }
+  if (!bytes) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
   const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   const value = bytes / 1024 ** exponent
@@ -556,9 +612,7 @@ function formatBytes(bytes) {
 }
 
 function formatTimestamp(value) {
-  if (!value) {
-    return ''
-  }
+  if (!value) return ''
   return new Date(value).toLocaleString('zh-CN', {
     hour12: false,
     month: 'short',
@@ -568,115 +622,110 @@ function formatTimestamp(value) {
   })
 }
 
+function moduleEmptyText() {
+  if (activeModule.value === 'bookmark') return '这里还没有匹配的书签。'
+  if (activeModule.value === 'image') return '这里还没有匹配的图片记录。'
+  if (activeModule.value === 'file') return '这里还没有匹配的文件记录。'
+  return '这里还没有匹配的文本记录。'
+}
 </script>
 
 <template>
-  <main class="relative overflow-hidden">
-    <div class="pointer-events-none absolute inset-0 overflow-hidden">
-      <div class="absolute left-[-8rem] top-10 h-72 w-72 rounded-full bg-emerald-400/10 blur-3xl animate-drift"></div>
-      <div class="absolute right-[-5rem] top-40 h-80 w-80 rounded-full bg-cyan-400/10 blur-3xl animate-drift"></div>
-    </div>
+  <main class="island-shell" :style="wallpaperStyle">
+    <div class="island-backdrop"></div>
+    <div class="island-grain"></div>
 
-    <div class="relative mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
-      <header class="min-w-0 overflow-hidden rounded-[24px] border border-white/10 bg-[color:var(--panel)] px-4 py-4 backdrop-blur-xl sm:px-5">
-        <div class="flex flex-wrap items-center gap-3">
-          <div class="mr-auto min-w-0">
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">LocalDrop</p>
-            <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-300">
-              <span class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">3 秒轮询</span>
-              <span class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">无账号</span>
-              <span class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1">SQLite + 本地文件</span>
+    <div class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 px-4 py-4 sm:px-5 lg:px-6 lg:py-6">
+      <header class="island-hero">
+        <div class="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+          <div class="min-w-0 max-w-3xl">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="island-chip">LocalDrop</span>
+              <span class="island-chip island-chip-soft">3s 轮询</span>
+              <span class="island-chip island-chip-soft">SQLite + 本地文件</span>
+              <span class="island-chip" :class="wallpaperState === 'ready' ? 'island-chip-mint' : 'island-chip-soft'">Bing 壁纸</span>
+            </div>
+            <p class="island-eyebrow mt-5">Island Transfer Hub</p>
+            <h1 class="island-title mt-2">把局域网临时文件站，改造成一座轻松好用的无人岛码头。</h1>
+            <p class="island-subtitle mt-4 max-w-2xl">
+              文本、图片、文件和浏览器书签都在一个入口里管理。保留当前同步能力，只把界面重写成更接近
+              animal-island-ui 的温暖圆润风格。
+            </p>
+
+            <div class="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <article v-for="card in statCards" :key="card.label" class="island-stat">
+                <p class="island-stat-label">{{ card.label }}</p>
+                <p class="island-stat-value">{{ card.value }}</p>
+                <p class="island-stat-detail">{{ card.detail }}</p>
+              </article>
             </div>
           </div>
 
-          <div class="grid min-w-0 flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            <article
-              v-for="card in statCards"
-              :key="card.label"
-              class="min-w-0 rounded-[18px] border border-white/10 bg-[color:var(--panel-strong)] px-3 py-3"
-            >
-              <div class="flex items-baseline justify-between gap-3">
-                <p class="truncate text-xs uppercase tracking-[0.22em] text-slate-500">{{ card.label }}</p>
-                <p class="shrink-0 text-lg font-semibold text-slate-50">{{ card.value }}</p>
+          <aside class="island-postcard lg:max-w-sm">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="island-eyebrow">Today Backdrop</p>
+                <p class="mt-1 text-sm text-[color:var(--island-text-muted)]">当前背景来源</p>
               </div>
-              <p class="mt-2 truncate text-xs text-slate-400">{{ card.detail }}</p>
-            </article>
-          </div>
+              <button class="island-button island-button-secondary island-button-sm" @click="refreshWallpaperNow">刷新</button>
+            </div>
+            <div class="mt-4 island-postcard-frame">
+              <div v-if="wallpaper.imageUrl" class="island-postcard-image" :style="{ backgroundImage: `url(${wallpaper.imageUrl})` }"></div>
+              <div v-else class="island-postcard-empty">SYNCING...</div>
+            </div>
+            <p class="mt-4 text-sm font-semibold text-[color:var(--island-text)]">{{ wallpaper.title || 'Bing Daily Wallpaper' }}</p>
+            <p class="mt-2 text-sm leading-6 text-[color:var(--island-text-soft)]">{{ wallpaper.copyright || '壁纸信息将在载入成功后显示。' }}</p>
+            <div class="mt-4 flex flex-wrap gap-2">
+              <a v-if="wallpaperAttributionUrl" class="island-button island-button-secondary island-button-sm" :href="wallpaperAttributionUrl" target="_blank" rel="noreferrer">查看来源</a>
+            </div>
+          </aside>
         </div>
       </header>
 
-      <section class="grid gap-6 lg:grid-cols-[1.05fr_1.4fr] lg:items-start">
-        <div class="min-w-0 space-y-4">
-          <article class="min-w-0 overflow-hidden rounded-[28px] border border-white/10 bg-[color:var(--panel)] p-5 backdrop-blur-xl sm:p-6">
-            <div class="flex items-start justify-between gap-4">
+      <section class="grid gap-5 xl:grid-cols-[370px_minmax(0,1fr)]">
+        <aside class="flex min-w-0 flex-col gap-5">
+          <article class="island-panel">
+            <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Control Deck</p>
-                <h2 class="mt-2 text-2xl font-semibold text-slate-50">同步入口</h2>
-                <p class="mt-2 text-sm leading-6 text-slate-400">
-                  直接输入文本、上传文件，或导入浏览器导出的书签 HTML。导入后的书签会单独保存，并在书签模块中统一浏览。
+                <p class="island-eyebrow">Control Desk</p>
+                <h2 class="island-panel-title mt-2">同步入口</h2>
+                <p class="mt-3 text-sm leading-6 text-[color:var(--island-text-soft)]">
+                  上传图片、文件、导入书签，或直接写入临时文本。所有内容都会进入右侧的模块仓库。
                 </p>
               </div>
-              <button
-                class="rounded-full border border-rose-400/20 bg-rose-400/10 px-4 py-2 text-sm font-medium text-rose-100 transition hover:bg-rose-400/20 disabled:cursor-not-allowed disabled:opacity-60"
-                :disabled="cleaning"
-                @click="cleanupOldImages"
-              >
-                {{ cleaning ? '清理中...' : '清理一周前图片' }}
+              <button class="island-button island-button-danger island-button-sm" :disabled="cleaning" @click="cleanupOldImages">
+                {{ cleaning ? '清理中...' : '清理旧图片' }}
               </button>
             </div>
 
-            <div class="mt-6 grid gap-3 sm:grid-cols-2">
-              <button
-                class="rounded-[22px] border border-cyan-300/20 bg-cyan-300/10 px-5 py-4 text-left text-cyan-50 transition hover:bg-cyan-300/20 disabled:cursor-not-allowed disabled:opacity-60"
-                :disabled="uploadingFile"
-                @click="openImageDialog"
-              >
-                <span class="block text-xs uppercase tracking-[0.3em] text-cyan-100/70">Upload</span>
-                <span class="mt-2 block text-lg font-semibold">
-                  {{ uploadingFile ? '上传中...' : '选择图片文件' }}
-                </span>
+            <div class="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+              <button class="island-action island-action-mint" :disabled="uploadingFile" @click="openImageDialog">
+                <span class="island-action-kicker">Image</span>
+                <span class="island-action-title">{{ uploadingFile ? '上传中...' : '选择图片' }}</span>
               </button>
-
-              <button
-                class="rounded-[22px] border border-sky-300/20 bg-sky-300/10 px-5 py-4 text-left text-sky-50 transition hover:bg-sky-300/20 disabled:cursor-not-allowed disabled:opacity-60"
-                :disabled="importingBookmarks"
-                @click="openBookmarkDialog"
-              >
-                <span class="block text-xs uppercase tracking-[0.3em] text-sky-100/70">Bookmarks</span>
-                <span class="mt-2 block text-lg font-semibold">
-                  {{ importingBookmarks ? '同步中...' : '导入书签 HTML' }}
-                </span>
+              <button class="island-action island-action-sky" :disabled="importingBookmarks" @click="openBookmarkDialog">
+                <span class="island-action-kicker">Bookmarks</span>
+                <span class="island-action-title">{{ importingBookmarks ? '同步中...' : '导入书签' }}</span>
               </button>
+            </div>
 
-              <div class="rounded-[22px] border border-emerald-400/20 bg-emerald-400/10 p-4 text-slate-50 sm:col-span-2">
-                <label for="text-sync-input" class="block text-xs uppercase tracking-[0.3em] text-emerald-100/70">Text</label>
-                <textarea
-                  id="text-sync-input"
-                  v-model="textDraft"
-                  class="mt-3 min-h-28 w-full rounded-2xl border border-emerald-100/15 bg-slate-950/40 p-3 text-sm text-slate-50 outline-none placeholder:text-slate-500"
-                  placeholder="输入要同步到文本分组的内容"
-                ></textarea>
-                <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
-                  <p class="text-sm text-emerald-50/70">适合手动输入短文本、链接或临时备注。</p>
-                  <button
-                    class="rounded-full bg-emerald-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-300"
-                    @click="submitTextDraft"
-                  >
-                    添加文本记录
-                  </button>
-                </div>
+            <div class="mt-4 island-field">
+              <label for="text-sync-input" class="island-field-label">文本同步</label>
+              <textarea
+                id="text-sync-input"
+                v-model="textDraft"
+                class="island-textarea"
+                placeholder="输入短文本、链接或临时备注"
+              ></textarea>
+              <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+                <p class="text-sm text-[color:var(--island-text-muted)]">适合快速记事，不需要单独建文件。</p>
+                <button class="island-button island-button-primary" @click="submitTextDraft">写入文本栈</button>
               </div>
             </div>
 
-            <button
-              class="mt-3 w-full rounded-[22px] border border-white/10 bg-white/[0.05] px-5 py-4 text-left text-slate-100 transition hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
-              :disabled="uploadingFile"
-              @click="openFileDialog"
-            >
-              <span class="block text-xs uppercase tracking-[0.3em] text-slate-400">File</span>
-              <span class="mt-2 block text-lg font-semibold">
-                {{ uploadingFile ? '上传中...' : '选择任意文件并保留下载入口' }}
-              </span>
+            <button class="mt-4 island-action island-action-amber w-full" :disabled="uploadingFile" @click="openFileDialog">
+              <span class="island-action-kicker">Files</span>
+              <span class="island-action-title">{{ uploadingFile ? '上传中...' : '上传任意文件' }}</span>
             </button>
 
             <input ref="imageInput" type="file" accept="image/*" class="hidden" @change="handleSelectedFile" />
@@ -684,75 +733,73 @@ function formatTimestamp(value) {
             <input ref="bookmarkInput" type="file" accept=".html,text/html" class="hidden" @change="handleBookmarkFile" />
 
             <div
-              class="mt-4 rounded-[24px] border border-dashed px-5 py-6 text-center transition"
-              :class="dragActive ? 'border-emerald-300 bg-emerald-400/10' : 'border-white/15 bg-white/[0.03]'"
+              class="mt-4 island-dropzone"
+              :class="dragActive ? 'island-dropzone-active' : ''"
               @dragenter.prevent="onDragEnter"
               @dragover.prevent="onDragEnter"
               @dragleave.prevent="onDragLeave"
               @drop.prevent="onDrop"
             >
-              <p class="text-base font-medium text-slate-100">拖拽文件到这里</p>
-              <p class="mt-2 text-sm text-slate-400">支持直接从桌面拖入 PNG / JPG / WEBP / PDF / TXT 等文件</p>
+              <p class="island-panel-title text-base">拖拽文件到这里</p>
+              <p class="mt-2 text-sm leading-6 text-[color:var(--island-text-muted)]">支持 PNG、JPG、WEBP、PDF、TXT 等常见文件格式。</p>
             </div>
           </article>
 
-          <article
-            v-if="notice || errorMessage || lastSyncedAt"
-            class="min-w-0 overflow-hidden rounded-[24px] border border-white/10 bg-[color:var(--panel)] p-5 backdrop-blur-xl"
-          >
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">状态面板</p>
-            <p v-if="notice" class="mt-3 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 px-4 py-3 text-sm text-emerald-100">
-              {{ notice }}
-            </p>
-            <p v-if="errorMessage" class="mt-3 rounded-2xl border border-rose-400/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
-              {{ errorMessage }}
-            </p>
-            <p v-if="lastSyncedAt" class="mt-3 text-sm text-slate-400">
-              最近刷新: {{ formatTimestamp(lastSyncedAt) }}
-            </p>
-            <p v-if="bookmarkSyncedAt" class="mt-2 text-sm text-slate-400">
-              书签最近同步: {{ formatTimestamp(bookmarkSyncedAt) }}
-            </p>
+          <article class="island-panel">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p class="island-eyebrow">Window Mood</p>
+                <h2 class="island-panel-title mt-2">界面透明度</h2>
+              </div>
+              <span class="island-badge">{{ panelOpacity }}%</span>
+            </div>
+            <p class="mt-3 text-sm leading-6 text-[color:var(--island-text-soft)]">调节主面板透明度，范围 35% 到 100%。</p>
+            <input
+              :value="panelOpacity"
+              type="range"
+              min="35"
+              max="100"
+              step="1"
+              class="mt-4 island-slider"
+              @input="updatePanelOpacity($event.target.value)"
+            />
           </article>
-        </div>
 
-        <section class="min-w-0 overflow-hidden rounded-[28px] border border-white/10 bg-[color:var(--panel)] p-5 backdrop-blur-xl sm:p-6">
-          <div class="flex flex-wrap items-center justify-between gap-4">
+          <article v-if="notice || errorMessage || lastSyncedAt" class="island-panel">
+            <p class="island-eyebrow">Status Log</p>
+            <div v-if="notice" class="island-message island-message-success mt-4">{{ notice }}</div>
+            <div v-if="errorMessage" class="island-message island-message-danger mt-4">{{ errorMessage }}</div>
+            <p v-if="lastSyncedAt" class="mt-4 text-sm text-[color:var(--island-text-soft)]">最近刷新：{{ formatTimestamp(lastSyncedAt) }}</p>
+            <p v-if="bookmarkSyncedAt" class="mt-2 text-sm text-[color:var(--island-text-soft)]">书签同步：{{ formatTimestamp(bookmarkSyncedAt) }}</p>
+          </article>
+        </aside>
+
+        <section class="island-panel min-w-0">
+          <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Content Hub</p>
-              <h2 class="mt-2 text-2xl font-semibold text-slate-50">聚合展示入口</h2>
-              <p class="mt-2 text-sm text-slate-400">点击任一模块，在独立窗口里浏览对应内容。</p>
+              <p class="island-eyebrow">Module Dock</p>
+              <h2 class="island-panel-title mt-2">内容模块</h2>
+              <p class="mt-3 text-sm leading-6 text-[color:var(--island-text-soft)]">每个模块都支持筛选、标签管理、置顶、删除和下载操作。</p>
             </div>
-            <button
-              class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-200 transition hover:bg-white/10"
-              @click="refreshAll"
-            >
-              立即刷新
-            </button>
+            <button class="island-button island-button-secondary" @click="refreshAll">立即刷新</button>
           </div>
 
-          <div v-if="loading" class="mt-8 rounded-[24px] border border-white/10 bg-white/[0.03] px-5 py-12 text-center text-slate-400">
-            正在加载 LocalDrop 内容...
-          </div>
+          <div v-if="loading" class="island-empty mt-6">正在读取内容仓库...</div>
 
-          <div v-else class="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <button
-              v-for="card in moduleCards"
-              :key="card.id"
-              class="group min-w-0 rounded-[24px] border border-white/10 bg-white/[0.03] p-4 text-left transition hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.05]"
-              @click="openModule(card.id)"
-            >
+          <div v-else class="mt-6 grid gap-4 md:grid-cols-2 2xl:grid-cols-4">
+            <button v-for="card in moduleCards" :key="card.id" class="island-module" :data-tone="card.tone" @click="openModule(card.id)">
               <div class="flex items-start justify-between gap-3">
                 <div class="min-w-0">
-                  <p class="text-xs uppercase tracking-[0.25em] text-slate-500">{{ card.label }}</p>
-                  <h3 class="mt-2 text-lg font-semibold text-slate-50">{{ card.title }}</h3>
+                  <p class="island-module-label">{{ card.label }}</p>
+                  <h3 class="island-module-title">{{ card.title }}</h3>
                 </div>
-                <span class="shrink-0 rounded-full border border-white/10 bg-white/[0.06] px-3 py-1 text-xs text-slate-200">
-                  {{ card.count }}
-                </span>
+                <span class="island-badge">{{ card.count }}</span>
               </div>
-              <p class="mt-3 text-sm text-slate-400">{{ card.detail }}</p>
-              <p class="mt-6 text-sm text-slate-200 transition group-hover:text-white">打开模块</p>
+              <p class="mt-4 text-sm leading-6 text-[color:var(--island-text-soft)]">{{ card.detail }}</p>
+              <div class="mt-5 island-module-footer">
+                <span>打开模块</span>
+                <span>›</span>
+              </div>
             </button>
           </div>
         </section>
@@ -760,428 +807,158 @@ function formatTimestamp(value) {
     </div>
 
     <teleport to="body">
-      <div
-        v-if="activeModuleMeta"
-        class="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/85 p-4 backdrop-blur-md"
-        @click.self="closeModule"
-      >
-        <div class="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-[28px] border border-white/10 bg-slate-900/95 shadow-2xl">
-          <div class="border-b border-white/10 px-5 py-4">
-            <div class="flex flex-wrap items-center justify-between gap-4">
-              <div class="min-w-0">
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-500">{{ activeModuleMeta.label }}</p>
-                <div class="mt-2 flex flex-wrap items-center gap-3">
-                  <h3 class="text-2xl font-semibold text-slate-50">{{ activeModuleMeta.title }}</h3>
-                  <span class="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-xs text-slate-300">
-                    {{ activeModuleRecords.length }} 条结果
-                  </span>
-                </div>
-              </div>
-              <div class="flex flex-wrap items-center gap-3">
-                <div class="flex min-w-0 items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-2">
-                  <input
-                    v-model="filterQuery"
-                    type="text"
-                    class="min-w-0 flex-1 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500 sm:min-w-[14rem]"
-                    placeholder="过滤标题、链接或文件名"
-                  />
-                  <button
-                    v-if="filterQuery"
-                    class="text-xs text-slate-400 transition hover:text-slate-200"
-                    @click="clearFilter"
-                  >
-                    清空
-                  </button>
-                </div>
-                <button
-                  class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-100 transition hover:bg-white/10"
-                  @click="closeModule"
-                >
-                  关闭
-                </button>
+      <div v-if="activeModuleMeta" class="island-modal-backdrop" @click.self="closeModule">
+        <div class="island-modal">
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <p class="island-eyebrow">{{ activeModuleMeta.label }}</p>
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <h3 class="island-panel-title">{{ activeModuleMeta.title }}</h3>
+                <span class="island-badge">{{ activeModuleRecords.length }}</span>
               </div>
             </div>
-            <div v-if="activeModuleTags.length" class="mt-4 flex flex-wrap items-center gap-2">
-              <button
-                class="rounded-full border px-3 py-1 text-xs transition"
-                :class="activeTagFilter ? 'border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]' : 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100'"
-                @click="activeTagFilter = ''"
-              >
-                全部标签
-              </button>
-              <button
-                v-for="tag in activeModuleTags"
-                :key="tag"
-                class="rounded-full border px-3 py-1 text-xs transition"
-                :class="activeTagFilter === tag ? 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100' : 'border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]'"
-                @click="toggleTagFilter(tag)"
-              >
-                #{{ tag }}
-              </button>
+            <div class="flex flex-wrap items-center gap-2">
+              <div class="island-search">
+                <input v-model="filterQuery" type="text" class="island-input" placeholder="过滤标题、链接或文件名" />
+              </div>
+              <button v-if="filterQuery" class="island-button island-button-secondary island-button-sm" @click="clearFilter">清空</button>
+              <button class="island-button island-button-secondary island-button-sm" @click="closeModule">关闭</button>
             </div>
           </div>
 
-          <div class="overflow-y-auto p-5 sm:p-6">
-            <div v-if="activeModule === 'image'">
-              <div v-if="activeModuleRecords.length" class="grid grid-cols-2 gap-3 xl:grid-cols-4">
-                <article
-                  v-for="record in activeModuleRecords"
-                  :key="record.id"
-                  class="animate-rise overflow-hidden rounded-[24px] border border-white/10 bg-white/[0.03]"
-                >
-                  <button
-                    class="group relative block aspect-square w-full overflow-hidden bg-slate-950/50"
-                    @click="previewRecord = record"
-                  >
-                    <img
-                      :src="imageUrl(record)"
-                      :alt="`LocalDrop image ${record.id}`"
-                      class="h-full w-full object-cover transition duration-500 group-hover:scale-105"
-                      loading="lazy"
-                    />
-                    <div class="absolute inset-x-0 bottom-0 flex items-end justify-between bg-gradient-to-t from-slate-950/90 via-slate-950/30 to-transparent p-3">
-                      <span class="text-xs text-slate-200">{{ formatTimestamp(record.createdAt) }}</span>
-                      <span
-                        v-if="record.isTop"
-                        class="rounded-full bg-emerald-400 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-950"
-                      >
-                        pinned
-                      </span>
-                    </div>
+          <div v-if="activeModuleTags.length" class="mt-5 flex flex-wrap gap-2">
+            <button class="island-tag" :class="!activeTagFilter ? 'island-tag-active' : ''" @click="activeTagFilter = ''">全部</button>
+            <button v-for="tag in activeModuleTags" :key="tag" class="island-tag" :class="activeTagFilter === tag ? 'island-tag-active' : ''" @click="toggleTagFilter(tag)">#{{ tag }}</button>
+          </div>
+
+          <div class="mt-6">
+            <div v-if="activeModule === 'bookmark'">
+              <div v-if="activeModuleRecords.length" class="grid gap-4 xl:grid-cols-2">
+                <article v-for="bookmark in activeModuleRecords" :key="`${bookmark.id}-${bookmark.url}`" class="island-record">
+                  <p class="island-record-title break-all">{{ bookmark.title || '未命名书签' }}</p>
+                  <p v-if="bookmark.folderPath" class="mt-2 text-sm text-[color:var(--island-text-muted)]">{{ bookmark.folderPath }}</p>
+                  <a class="mt-3 block break-all text-sm font-semibold text-[color:var(--island-primary-strong)] underline decoration-dotted underline-offset-4" :href="bookmark.url" target="_blank" rel="noreferrer">{{ bookmark.url }}</a>
+                </article>
+              </div>
+              <div v-else class="island-empty">{{ moduleEmptyText() }}</div>
+            </div>
+
+            <div v-else-if="activeModule === 'image'">
+              <div v-if="activeModuleRecords.length" class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                <article v-for="record in activeModuleRecords" :key="record.id" class="island-record island-record-media">
+                  <button class="island-image-card" @click="previewRecord = record">
+                    <img :src="imageUrl(record)" :alt="`LocalDrop image ${record.id}`" class="island-thumb" loading="lazy" />
+                    <span v-if="record.isTop" class="island-corner-pill">TOP</span>
                   </button>
-                  <div class="flex flex-wrap items-center gap-2 p-3 text-xs text-slate-400">
-                    <span>{{ formatBytes(record.fileSize) }}</span>
-                    <span class="truncate">{{ fileLabel(record) }}</span>
-                  </div>
-                  <div class="px-3">
-                    <label class="text-[11px] uppercase tracking-[0.22em] text-slate-500">名称</label>
-                    <div class="mt-2 flex gap-2">
-                      <input
-                        v-model="renameDrafts[record.id]"
-                        type="text"
-                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                        :placeholder="fileLabel(record)"
-                        @focus="onRenameDraftFocus(record)"
-                        @keyup.enter="renameBinaryRecord(record)"
-                      />
-                      <button
-                        class="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition hover:bg-white/10"
-                        @click="renameBinaryRecord(record)"
-                      >
-                        改名
-                      </button>
+                  <div class="p-4">
+                    <div class="flex flex-wrap items-center gap-2 text-sm text-[color:var(--island-text-muted)]">
+                      <span>{{ formatBytes(record.fileSize) }}</span>
+                      <span>{{ formatTimestamp(record.createdAt) }}</span>
                     </div>
-                  </div>
-                  <div class="px-3 pt-3">
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        v-for="tag in record.tags || []"
-                        :key="tag"
-                        class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
-                        @click="removeTag(record, tag)"
-                      >
-                        #{{ tag }} ×
-                      </button>
+                    <p class="mt-3 island-record-title break-all">{{ fileLabel(record) }}</p>
+                    <div class="mt-3 flex gap-2">
+                      <input v-model="renameDrafts[record.id]" type="text" class="island-input flex-1" :placeholder="fileLabel(record)" @focus="onRenameDraftFocus(record)" @keyup.enter="renameBinaryRecord(record)" />
+                      <button class="island-button island-button-secondary island-button-sm" @click="renameBinaryRecord(record)">改名</button>
                     </div>
-                    <div class="mt-2 flex gap-2">
-                      <input
-                        v-model="tagDrafts[record.id]"
-                        type="text"
-                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                        placeholder="添加标签"
-                        @keyup.enter="addTag(record)"
-                      />
-                      <button
-                        class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
-                        @click="addTag(record)"
-                      >
-                        添加
-                      </button>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <button v-for="tag in record.tags || []" :key="tag" class="island-tag island-tag-soft" @click="removeTag(record, tag)">#{{ tag }} ×</button>
                     </div>
-                  </div>
-                  <div class="flex flex-wrap gap-2 px-3 pb-3">
-                    <button
-                      class="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-100 transition hover:bg-white/10"
-                      @click="toggleTop(record)"
-                    >
-                      {{ record.isTop ? '取消置顶' : '置顶' }}
-                    </button>
-                    <a
-                      class="rounded-full border border-amber-300/20 bg-amber-300/10 px-3 py-1.5 text-xs text-amber-100 transition hover:bg-amber-300/20"
-                      :href="downloadUrl(record)"
-                    >
-                      下载
-                    </a>
-                    <button
-                      class="rounded-full border border-rose-400/20 bg-rose-400/10 px-3 py-1.5 text-xs text-rose-100 transition hover:bg-rose-400/20"
-                      @click="deleteRecord(record)"
-                    >
-                      删除
-                    </button>
+                    <div class="mt-3 flex gap-2">
+                      <input v-model="tagDrafts[record.id]" type="text" class="island-input flex-1" placeholder="添加标签" @keyup.enter="addTag(record)" />
+                      <button class="island-button island-button-primary island-button-sm" @click="addTag(record)">添加</button>
+                    </div>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <button class="island-button island-button-secondary island-button-sm" @click="toggleTop(record)">{{ record.isTop ? '取消置顶' : '置顶' }}</button>
+                      <a class="island-button island-button-amber island-button-sm" :href="downloadUrl(record)">下载</a>
+                      <button class="island-button island-button-danger island-button-sm" @click="deleteRecord(record)">删除</button>
+                    </div>
                   </div>
                 </article>
               </div>
-              <div v-else class="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-12 text-center text-sm text-slate-400">
-                还没有匹配的图片记录。
-              </div>
+              <div v-else class="island-empty">{{ moduleEmptyText() }}</div>
             </div>
 
             <div v-else-if="activeModule === 'file'">
               <div v-if="activeModuleRecords.length" class="grid gap-4 xl:grid-cols-2">
-                <article
-                  v-for="record in activeModuleRecords"
-                  :key="record.id"
-                  class="animate-rise rounded-[24px] border border-white/10 bg-white/[0.03] p-4 transition hover:-translate-y-0.5"
-                >
-                  <div class="flex items-start gap-4">
-                    <div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-[18px] border border-amber-300/20 bg-amber-300/10 text-sm font-semibold tracking-[0.18em] text-amber-100">
-                      {{ fileExtension(record) }}
-                    </div>
+                <article v-for="record in activeModuleRecords" :key="record.id" class="island-record">
+                  <div class="flex items-start gap-3">
+                    <div class="island-file-ext">{{ fileExtension(record) }}</div>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center gap-2">
-                        <p class="break-all text-base font-semibold text-slate-50">{{ fileLabel(record) }}</p>
-                        <span
-                          v-if="record.isTop"
-                          class="rounded-full bg-emerald-400 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-950"
-                        >
-                          pinned
-                        </span>
+                        <p class="island-record-title break-all">{{ fileLabel(record) }}</p>
+                        <span v-if="record.isTop" class="island-corner-inline">TOP</span>
                       </div>
-                      <p v-if="record.mimeType" class="mt-1 text-sm text-slate-400">{{ record.mimeType }}</p>
-                      <div class="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                      <p v-if="record.mimeType" class="mt-2 break-all text-sm text-[color:var(--island-text-muted)]">{{ record.mimeType }}</p>
+                      <div class="mt-3 flex flex-wrap items-center gap-2 text-sm text-[color:var(--island-text-muted)]">
                         <span>{{ formatBytes(record.fileSize) }}</span>
                         <span>{{ formatTimestamp(record.createdAt) }}</span>
-                        <span v-if="record.topAt">置顶于 {{ formatTimestamp(record.topAt) }}</span>
                       </div>
                     </div>
                   </div>
-
-                  <div class="mt-4">
-                    <label class="text-[11px] uppercase tracking-[0.22em] text-slate-500">名称</label>
-                    <div class="mt-2 flex gap-2">
-                      <input
-                        v-model="renameDrafts[record.id]"
-                        type="text"
-                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                        :placeholder="fileLabel(record)"
-                        @focus="onRenameDraftFocus(record)"
-                        @keyup.enter="renameBinaryRecord(record)"
-                      />
-                      <button
-                        class="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 transition hover:bg-white/10"
-                        @click="renameBinaryRecord(record)"
-                      >
-                        改名
-                      </button>
-                    </div>
-                    <div class="mt-3 flex flex-wrap gap-2">
-                      <button
-                        v-for="tag in record.tags || []"
-                        :key="tag"
-                        class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
-                        @click="removeTag(record, tag)"
-                      >
-                        #{{ tag }} ×
-                      </button>
-                    </div>
-                    <div class="mt-2 flex gap-2">
-                      <input
-                        v-model="tagDrafts[record.id]"
-                        type="text"
-                        class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                        placeholder="添加标签"
-                        @keyup.enter="addTag(record)"
-                      />
-                      <button
-                        class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
-                        @click="addTag(record)"
-                      >
-                        添加
-                      </button>
-                    </div>
+                  <div class="mt-3 flex gap-2">
+                    <input v-model="renameDrafts[record.id]" type="text" class="island-input flex-1" :placeholder="fileLabel(record)" @focus="onRenameDraftFocus(record)" @keyup.enter="renameBinaryRecord(record)" />
+                    <button class="island-button island-button-secondary island-button-sm" @click="renameBinaryRecord(record)">改名</button>
                   </div>
-
-                  <div class="mt-4 flex flex-wrap gap-2">
-                    <button
-                      class="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-100 transition hover:bg-white/10"
-                      @click="toggleTop(record)"
-                    >
-                      {{ record.isTop ? '取消置顶' : '置顶' }}
-                    </button>
-                    <a
-                      class="rounded-full border border-amber-300/20 bg-amber-300/10 px-3 py-1.5 text-xs text-amber-100 transition hover:bg-amber-300/20"
-                      :href="downloadUrl(record)"
-                    >
-                      下载
-                    </a>
-                    <button
-                      class="rounded-full border border-rose-400/20 bg-rose-400/10 px-3 py-1.5 text-xs text-rose-100 transition hover:bg-rose-400/20"
-                      @click="deleteRecord(record)"
-                    >
-                      删除
-                    </button>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <button v-for="tag in record.tags || []" :key="tag" class="island-tag island-tag-soft" @click="removeTag(record, tag)">#{{ tag }} ×</button>
+                  </div>
+                  <div class="mt-3 flex gap-2">
+                    <input v-model="tagDrafts[record.id]" type="text" class="island-input flex-1" placeholder="添加标签" @keyup.enter="addTag(record)" />
+                    <button class="island-button island-button-primary island-button-sm" @click="addTag(record)">添加</button>
+                  </div>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <button class="island-button island-button-secondary island-button-sm" @click="toggleTop(record)">{{ record.isTop ? '取消置顶' : '置顶' }}</button>
+                    <a class="island-button island-button-amber island-button-sm" :href="downloadUrl(record)">下载</a>
+                    <button class="island-button island-button-danger island-button-sm" @click="deleteRecord(record)">删除</button>
                   </div>
                 </article>
               </div>
-              <div v-else class="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-12 text-center text-sm text-slate-400">
-                还没有匹配的文件记录。
-              </div>
-            </div>
-
-            <div v-else-if="activeModule === 'bookmark'">
-              <div v-if="activeModuleRecords.length" class="grid gap-4 xl:grid-cols-2">
-                <article
-                  v-for="bookmark in activeModuleRecords"
-                  :key="bookmark.id"
-                  class="animate-rise rounded-[24px] border border-white/10 bg-white/[0.03] p-4 transition hover:-translate-y-0.5"
-                >
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="rounded-full border border-sky-300/20 bg-sky-300/10 px-3 py-1 text-xs uppercase tracking-[0.25em] text-sky-100">
-                      bookmark
-                    </span>
-                    <span v-if="bookmark.folderPath" class="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-xs text-slate-300">
-                      {{ bookmark.folderPath }}
-                    </span>
-                  </div>
-
-                  <a
-                    :href="bookmark.url"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    class="mt-4 block text-lg font-semibold text-slate-50 transition hover:text-sky-200"
-                  >
-                    {{ bookmark.title }}
-                  </a>
-                  <p class="mt-2 break-all text-sm leading-6 text-slate-400">
-                    {{ bookmark.url }}
-                  </p>
-
-                  <div class="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-500">
-                    <span>顺序 {{ bookmark.sortOrder + 1 }}</span>
-                    <span>{{ formatTimestamp(bookmark.createdAt) }}</span>
-                  </div>
-
-                  <div class="mt-4">
-                    <a
-                      :href="bookmark.url"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      class="inline-flex rounded-full border border-sky-300/20 bg-sky-300/10 px-4 py-2 text-sm text-sky-100 transition hover:bg-sky-300/20"
-                    >
-                      新窗口打开
-                    </a>
-                  </div>
-                </article>
-              </div>
-              <div v-else class="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-12 text-center text-sm text-slate-400">
-                还没有匹配的书签记录。
-              </div>
+              <div v-else class="island-empty">{{ moduleEmptyText() }}</div>
             </div>
 
             <div v-else>
-              <div v-if="activeModuleRecords.length" class="space-y-4">
-                <article
-                  v-for="record in activeModuleRecords"
-                  :key="record.id"
-                  class="animate-rise overflow-hidden rounded-[24px] border p-4 transition hover:-translate-y-0.5 sm:p-5"
-                  :class="record.isTop ? 'border-emerald-300/30 bg-emerald-400/10' : 'border-white/10 bg-white/[0.03]'"
-                >
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="rounded-full bg-slate-200/10 px-3 py-1 text-xs uppercase tracking-[0.25em] text-slate-200">
-                      text
-                    </span>
-                    <span
-                      v-if="record.isTop"
-                      class="rounded-full bg-emerald-400 px-3 py-1 text-xs font-semibold uppercase tracking-[0.25em] text-slate-950"
-                    >
-                      pinned
-                    </span>
-                    <span class="ml-auto text-xs text-slate-400">{{ formatTimestamp(record.createdAt) }}</span>
+              <div v-if="activeModuleRecords.length" class="grid gap-4">
+                <article v-for="record in activeModuleRecords" :key="record.id" class="island-record">
+                  <div class="flex flex-wrap items-center gap-2 text-sm text-[color:var(--island-text-muted)]">
+                    <span>{{ formatTimestamp(record.createdAt) }}</span>
+                    <span v-if="record.isTop" class="island-corner-inline">TOP</span>
                   </div>
-
-                  <div class="mt-4 whitespace-pre-wrap break-words text-sm leading-7 text-slate-100 sm:text-base">
-                    {{ record.contentBody }}
+                  <pre class="island-pre">{{ record.contentBody }}</pre>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <button v-for="tag in record.tags || []" :key="tag" class="island-tag island-tag-soft" @click="removeTag(record, tag)">#{{ tag }} ×</button>
                   </div>
-
-                  <div class="mt-4 flex flex-wrap gap-2">
-                    <button
-                      v-for="tag in record.tags || []"
-                      :key="tag"
-                      class="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:bg-white/[0.08]"
-                      @click="removeTag(record, tag)"
-                    >
-                      #{{ tag }} ×
-                    </button>
+                  <div class="mt-3 flex gap-2">
+                    <input v-model="tagDrafts[record.id]" type="text" class="island-input flex-1" placeholder="添加标签" @keyup.enter="addTag(record)" />
+                    <button class="island-button island-button-primary island-button-sm" @click="addTag(record)">添加</button>
                   </div>
-                  <div class="mt-2 flex gap-2">
-                    <input
-                      v-model="tagDrafts[record.id]"
-                      type="text"
-                      class="min-w-0 flex-1 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                      placeholder="添加标签"
-                      @keyup.enter="addTag(record)"
-                    />
-                    <button
-                      class="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
-                      @click="addTag(record)"
-                    >
-                      添加
-                    </button>
-                  </div>
-
-                  <div class="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-400">
-                    <span v-if="record.topAt">置顶于 {{ formatTimestamp(record.topAt) }}</span>
-                  </div>
-
-                  <div class="mt-4 flex flex-wrap gap-3">
-                    <button
-                      class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-100 transition hover:bg-white/10"
-                      @click="toggleTop(record)"
-                    >
-                      {{ record.isTop ? '取消置顶' : '置顶' }}
-                    </button>
-                    <button
-                      class="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-300/20"
-                      @click="copyText(record.contentBody)"
-                    >
-                      复制文本
-                    </button>
-                    <button
-                      class="rounded-full border border-rose-400/20 bg-rose-400/10 px-4 py-2 text-sm text-rose-100 transition hover:bg-rose-400/20"
-                      @click="deleteRecord(record)"
-                    >
-                      删除
-                    </button>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <button class="island-button island-button-primary island-button-sm" @click="copyText(record.contentBody)">复制</button>
+                    <button class="island-button island-button-secondary island-button-sm" @click="toggleTop(record)">{{ record.isTop ? '取消置顶' : '置顶' }}</button>
+                    <button class="island-button island-button-danger island-button-sm" @click="deleteRecord(record)">删除</button>
                   </div>
                 </article>
               </div>
-              <div v-else class="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-12 text-center text-sm text-slate-400">
-                还没有匹配的文本记录。
-              </div>
+              <div v-else class="island-empty">{{ moduleEmptyText() }}</div>
             </div>
           </div>
         </div>
       </div>
+    </teleport>
 
-      <div
-        v-if="previewRecord"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 p-4 backdrop-blur-md"
-        @click.self="previewRecord = null"
-      >
-        <div class="w-full max-w-5xl overflow-hidden rounded-[28px] border border-white/10 bg-slate-900/90 shadow-2xl">
-          <div class="flex items-center justify-between border-b border-white/10 px-5 py-4">
+    <teleport to="body">
+      <div v-if="previewRecord" class="island-modal-backdrop" @click.self="previewRecord = null">
+        <div class="island-preview-modal">
+          <img :src="imageUrl(previewRecord)" :alt="fileLabel(previewRecord)" class="max-h-[78vh] w-full rounded-[26px] object-contain bg-[#f4eddd]" />
+          <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Image Preview</p>
-              <p class="mt-1 text-sm text-slate-300">{{ formatTimestamp(previewRecord.createdAt) }}</p>
+              <p class="island-record-title break-all">{{ fileLabel(previewRecord) }}</p>
+              <p class="mt-2 text-sm text-[color:var(--island-text-muted)]">{{ formatTimestamp(previewRecord.createdAt) }} / {{ formatBytes(previewRecord.fileSize) }}</p>
             </div>
-            <button
-              class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-100 transition hover:bg-white/10"
-              @click="previewRecord = null"
-            >
-              关闭
-            </button>
+            <div class="flex flex-wrap gap-2">
+              <a class="island-button island-button-amber island-button-sm" :href="downloadUrl(previewRecord)">下载</a>
+              <button class="island-button island-button-secondary island-button-sm" @click="previewRecord = null">关闭</button>
+            </div>
           </div>
-          <img :src="imageUrl(previewRecord)" :alt="`Preview ${previewRecord.id}`" class="max-h-[80vh] w-full object-contain" />
         </div>
       </div>
     </teleport>

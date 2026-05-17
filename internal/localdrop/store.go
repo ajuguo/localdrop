@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,17 +32,33 @@ type Record struct {
 }
 
 type StorageUsage struct {
-	TotalBytes int64 `json:"totalBytes"`
-	DBBytes    int64 `json:"dbBytes"`
-	ImageBytes int64 `json:"imageBytes"`
-	FileBytes  int64 `json:"fileBytes"`
+	TotalBytes     int64 `json:"totalBytes"`
+	DBBytes        int64 `json:"dbBytes"`
+	ImageBytes     int64 `json:"imageBytes"`
+	FileBytes      int64 `json:"fileBytes"`
+	WallpaperBytes int64 `json:"wallpaperBytes"`
+}
+
+type WallpaperCache struct {
+	CacheDate     string    `json:"date"`
+	ImagePath     string    `json:"imagePath"`
+	ImageMimeType string    `json:"imageMimeType"`
+	Title         string    `json:"title"`
+	Copyright     string    `json:"copyright"`
+	CopyrightLink string    `json:"copyrightLink"`
+	SyncedAt      time.Time `json:"syncedAt"`
+}
+
+type UISettings struct {
+	PanelOpacity int `json:"panelOpacity"`
 }
 
 type Store struct {
-	db        *sql.DB
-	dbPath    string
-	imagesDir string
-	filesDir  string
+	db           *sql.DB
+	dbPath       string
+	imagesDir    string
+	filesDir     string
+	wallpaperDir string
 }
 
 type imageCandidate struct {
@@ -49,7 +66,7 @@ type imageCandidate struct {
 	FileName string
 }
 
-func OpenStore(dbPath, imagesDir, filesDir string) (*Store, error) {
+func OpenStore(dbPath, imagesDir, filesDir, wallpaperDir string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
@@ -59,6 +76,9 @@ func OpenStore(dbPath, imagesDir, filesDir string) (*Store, error) {
 	if err := os.MkdirAll(filesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create files dir: %w", err)
 	}
+	if err := os.MkdirAll(wallpaperDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create wallpapers dir: %w", err)
+	}
 
 	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on", dbPath)
 	db, err := sql.Open("sqlite3", dsn)
@@ -67,10 +87,11 @@ func OpenStore(dbPath, imagesDir, filesDir string) (*Store, error) {
 	}
 
 	store := &Store{
-		db:        db,
-		dbPath:    dbPath,
-		imagesDir: imagesDir,
-		filesDir:  filesDir,
+		db:           db,
+		dbPath:       dbPath,
+		imagesDir:    imagesDir,
+		filesDir:     filesDir,
+		wallpaperDir: wallpaperDir,
 	}
 
 	if err := store.migrate(); err != nil {
@@ -114,6 +135,21 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 
 CREATE INDEX IF NOT EXISTS idx_bookmarks_sort
 ON bookmarks (sort_order ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS wallpaper_cache (
+    cache_date TEXT PRIMARY KEY,
+    image_path TEXT NOT NULL,
+    image_mime_type TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    copyright TEXT NOT NULL DEFAULT '',
+    copyright_link TEXT NOT NULL DEFAULT '',
+    synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 `
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -428,13 +464,110 @@ func (s *Store) ComputeUsage() (StorageUsage, error) {
 	if err != nil {
 		return StorageUsage{}, fmt.Errorf("measure files dir: %w", err)
 	}
+	wallpaperBytes, err := dirSize(s.wallpaperDir)
+	if err != nil {
+		return StorageUsage{}, fmt.Errorf("measure wallpapers dir: %w", err)
+	}
 
 	return StorageUsage{
-		DBBytes:    dbBytes,
-		ImageBytes: imageBytes,
-		FileBytes:  fileBytes,
-		TotalBytes: dbBytes + imageBytes + fileBytes,
+		DBBytes:        dbBytes,
+		ImageBytes:     imageBytes,
+		FileBytes:      fileBytes,
+		WallpaperBytes: wallpaperBytes,
+		TotalBytes:     dbBytes + imageBytes + fileBytes + wallpaperBytes,
 	}, nil
+}
+
+func (s *Store) GetWallpaperCache(ctx context.Context) (*WallpaperCache, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT cache_date, image_path, image_mime_type, title, copyright, copyright_link, synced_at
+FROM wallpaper_cache
+ORDER BY synced_at DESC
+LIMIT 1`)
+
+	var (
+		item      WallpaperCache
+		syncedRaw time.Time
+	)
+	if err := row.Scan(
+		&item.CacheDate,
+		&item.ImagePath,
+		&item.ImageMimeType,
+		&item.Title,
+		&item.Copyright,
+		&item.CopyrightLink,
+		&syncedRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query wallpaper cache: %w", err)
+	}
+	item.SyncedAt = syncedRaw.UTC()
+	return &item, nil
+}
+
+func (s *Store) SaveWallpaperCache(ctx context.Context, item WallpaperCache) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin wallpaper cache tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wallpaper_cache WHERE cache_date <> ?`, item.CacheDate); err != nil {
+		return fmt.Errorf("clear old wallpaper cache: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO wallpaper_cache (cache_date, image_path, image_mime_type, title, copyright, copyright_link, synced_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(cache_date) DO UPDATE SET
+    image_path = excluded.image_path,
+    image_mime_type = excluded.image_mime_type,
+    title = excluded.title,
+    copyright = excluded.copyright,
+    copyright_link = excluded.copyright_link,
+    synced_at = excluded.synced_at
+`, item.CacheDate, item.ImagePath, item.ImageMimeType, item.Title, item.Copyright, item.CopyrightLink, item.SyncedAt.UTC()); err != nil {
+		return fmt.Errorf("upsert wallpaper cache: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit wallpaper cache tx: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetUISettings(ctx context.Context) (UISettings, error) {
+	settings := UISettings{PanelOpacity: 88}
+
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = 'panel_opacity'`).Scan(&raw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return settings, nil
+		}
+		return UISettings{}, fmt.Errorf("query panel opacity: %w", err)
+	}
+
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return settings, nil
+	}
+	settings.PanelOpacity = clampPanelOpacity(value)
+	return settings, nil
+}
+
+func (s *Store) SaveUISettings(ctx context.Context, settings UISettings) (UISettings, error) {
+	settings.PanelOpacity = clampPanelOpacity(settings.PanelOpacity)
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO app_settings (key, value)
+VALUES ('panel_opacity', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`, strconv.Itoa(settings.PanelOpacity)); err != nil {
+		return UISettings{}, fmt.Errorf("save panel opacity: %w", err)
+	}
+	return settings, nil
 }
 
 func fileSize(path string) (int64, error) {
@@ -521,6 +654,16 @@ func decodeTags(raw string) []string {
 		return []string{}
 	}
 	return normalizeTags(tags)
+}
+
+func clampPanelOpacity(value int) int {
+	if value < 35 {
+		return 35
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
 }
 
 func normalizeTags(tags []string) []string {

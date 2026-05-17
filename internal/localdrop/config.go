@@ -13,6 +13,7 @@ const (
 	defaultDatabaseName   = "localdrop.db"
 	defaultImagesDirName  = "images"
 	defaultFilesDirName   = "files"
+	defaultWallpapersName = "wallpapers"
 	defaultMaxUploadBytes = 0
 )
 
@@ -22,6 +23,7 @@ type Config struct {
 	DBPath         string
 	ImagesDir      string
 	FilesDir       string
+	WallpapersDir  string
 	WebDevURL      string
 	MaxUploadBytes int64
 }
@@ -49,6 +51,7 @@ func LoadConfig() (Config, error) {
 		DBPath:         filepath.Join(absDataDir, defaultDatabaseName),
 		ImagesDir:      filepath.Join(absDataDir, defaultImagesDirName),
 		FilesDir:       filepath.Join(absDataDir, defaultFilesDirName),
+		WallpapersDir:  filepath.Join(absDataDir, defaultWallpapersName),
 		WebDevURL:      os.Getenv("LOCALDROP_WEB_DEV_URL"),
 		MaxUploadBytes: maxUploadBytes,
 	}, nil

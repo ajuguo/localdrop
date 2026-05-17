@@ -20,28 +20,36 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"localdrop/web"
 )
 
 type App struct {
-	cfg     Config
-	logger  *log.Logger
-	store   *Store
-	handler http.Handler
+	cfg         Config
+	logger      *log.Logger
+	store       *Store
+	handler     http.Handler
+	httpClient  *http.Client
+	bingAPIURL  string
+	bingBaseURL string
+	wallpaperMu sync.Mutex
 }
 
 func NewApp(cfg Config, logger *log.Logger) (*App, error) {
-	store, err := OpenStore(cfg.DBPath, cfg.ImagesDir, cfg.FilesDir)
+	store, err := OpenStore(cfg.DBPath, cfg.ImagesDir, cfg.FilesDir, cfg.WallpapersDir)
 	if err != nil {
 		return nil, err
 	}
 
 	app := &App{
-		cfg:    cfg,
-		logger: logger,
-		store:  store,
+		cfg:         cfg,
+		logger:      logger,
+		store:       store,
+		httpClient:  &http.Client{Timeout: 15 * time.Second},
+		bingAPIURL:  "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN",
+		bingBaseURL: "https://www.bing.com",
 	}
 
 	handler, err := app.routes()
@@ -76,8 +84,12 @@ func (a *App) routes() (http.Handler, error) {
 	mux.HandleFunc("PATCH /api/records/{id}/top", a.handleToggleTop)
 	mux.HandleFunc("DELETE /api/records/{id}", a.handleDeleteRecord)
 	mux.HandleFunc("GET /api/storage", a.handleStorage)
+	mux.HandleFunc("GET /api/settings/ui", a.handleGetUISettings)
+	mux.HandleFunc("PATCH /api/settings/ui", a.handleUpdateUISettings)
+	mux.HandleFunc("GET /api/wallpaper/bing", a.handleBingWallpaper)
 	mux.HandleFunc("POST /api/cleanup/old-images", a.handleCleanupOldImages)
 	mux.Handle("GET /media/", http.StripPrefix("/media/", http.FileServer(http.Dir(a.cfg.ImagesDir))))
+	mux.Handle("GET /wallpapers/", http.StripPrefix("/wallpapers/", http.FileServer(http.Dir(a.cfg.WallpapersDir))))
 
 	frontend, err := a.frontendHandler()
 	if err != nil {
@@ -96,7 +108,7 @@ func (a *App) frontendHandler() (http.Handler, error) {
 		}
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/media/") {
+			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/media/") || strings.HasPrefix(r.URL.Path, "/wallpapers/") {
 				http.NotFound(w, r)
 				return
 			}
@@ -427,6 +439,59 @@ func (a *App) handleStorage(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"storage": usage})
 }
 
+func (a *App) handleGetUISettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := a.store.GetUISettings(r.Context())
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"settings": settings})
+}
+
+func (a *App) handleUpdateUISettings(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	var payload struct {
+		PanelOpacity *int `json:"panelOpacity"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
+		a.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json: %w", err))
+		return
+	}
+	if payload.PanelOpacity == nil {
+		a.writeError(w, http.StatusBadRequest, errors.New("panelOpacity is required"))
+		return
+	}
+
+	settings, err := a.store.SaveUISettings(r.Context(), UISettings{PanelOpacity: *payload.PanelOpacity})
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"settings": settings})
+}
+
+func (a *App) handleBingWallpaper(w http.ResponseWriter, r *http.Request) {
+	forceRefresh := r.URL.Query().Get("refresh") == "1"
+	wallpaper, stale, err := a.getBingWallpaper(r.Context(), forceRefresh)
+	if err != nil {
+		a.writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	a.writeJSON(w, http.StatusOK, map[string]any{
+		"wallpaper": map[string]any{
+			"imageUrl":      a.wallpaperURL(wallpaper.ImagePath),
+			"title":         wallpaper.Title,
+			"copyright":     wallpaper.Copyright,
+			"copyrightLink": wallpaper.CopyrightLink,
+			"date":          wallpaper.CacheDate,
+			"syncedAt":      wallpaper.SyncedAt,
+			"isStale":       stale,
+		},
+	})
+}
+
 func (a *App) handleCleanupOldImages(w http.ResponseWriter, r *http.Request) {
 	before := time.Now().UTC().Add(-7 * 24 * time.Hour)
 	items, err := a.store.FindCleanupCandidates(r.Context(), before)
@@ -586,6 +651,177 @@ func generateFileName(ext string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s-%s%s", time.Now().UTC().Format("20060102T150405Z"), hex.EncodeToString(buf[:]), ext), nil
+}
+
+func (a *App) getBingWallpaper(ctx context.Context, forceRefresh bool) (WallpaperCache, bool, error) {
+	today := time.Now().UTC().Format("20060102")
+
+	cached, err := a.store.GetWallpaperCache(ctx)
+	if err != nil {
+		return WallpaperCache{}, false, err
+	}
+	if !forceRefresh && a.wallpaperCacheValid(cached, today) {
+		return *cached, false, nil
+	}
+
+	a.wallpaperMu.Lock()
+	defer a.wallpaperMu.Unlock()
+
+	cached, err = a.store.GetWallpaperCache(ctx)
+	if err != nil {
+		return WallpaperCache{}, false, err
+	}
+	if !forceRefresh && a.wallpaperCacheValid(cached, today) {
+		return *cached, false, nil
+	}
+
+	item, err := a.fetchAndCacheBingWallpaper(ctx)
+	if err == nil {
+		return item, false, nil
+	}
+	if a.wallpaperFileExists(cached) {
+		a.logger.Printf("use stale wallpaper cache after Bing fetch failed: %v", err)
+		return *cached, true, nil
+	}
+	return WallpaperCache{}, false, err
+}
+
+func (a *App) fetchAndCacheBingWallpaper(ctx context.Context) (WallpaperCache, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.bingAPIURL, nil)
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("build bing request: %w", err)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("fetch bing wallpaper: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return WallpaperCache{}, fmt.Errorf("bing wallpaper returned %s", resp.Status)
+	}
+
+	var payload struct {
+		Images []struct {
+			URL           string `json:"url"`
+			Title         string `json:"title"`
+			Copyright     string `json:"copyright"`
+			CopyrightLink string `json:"copyrightlink"`
+			StartDate     string `json:"startdate"`
+		} `json:"images"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return WallpaperCache{}, fmt.Errorf("decode bing wallpaper: %w", err)
+	}
+	if len(payload.Images) == 0 || payload.Images[0].URL == "" {
+		return WallpaperCache{}, errors.New("bing wallpaper payload is empty")
+	}
+
+	image := payload.Images[0]
+	cacheDate := strings.TrimSpace(image.StartDate)
+	if cacheDate == "" {
+		cacheDate = time.Now().UTC().Format("20060102")
+	}
+
+	imageURL, err := url.Parse(a.resolveBingURL(image.URL))
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("parse wallpaper image url: %w", err)
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, imageURL.String(), nil)
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("build wallpaper image request: %w", err)
+	}
+
+	resp, err = a.httpClient.Do(req)
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("download wallpaper image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return WallpaperCache{}, fmt.Errorf("wallpaper image returned %s", resp.Status)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(imageURL.Path))
+	}
+	ext := wallpaperExtension(contentType, imageURL.Path)
+	targetName := "bing-" + cacheDate + ext
+	targetPath := filepath.Join(a.cfg.WallpapersDir, targetName)
+	output, err := os.Create(targetPath)
+	if err != nil {
+		return WallpaperCache{}, fmt.Errorf("create wallpaper file: %w", err)
+	}
+	if _, err := io.Copy(output, resp.Body); err != nil {
+		output.Close()
+		_ = os.Remove(targetPath)
+		return WallpaperCache{}, fmt.Errorf("write wallpaper file: %w", err)
+	}
+	if err := output.Close(); err != nil {
+		_ = os.Remove(targetPath)
+		return WallpaperCache{}, fmt.Errorf("close wallpaper file: %w", err)
+	}
+
+	prev, err := a.store.GetWallpaperCache(ctx)
+	if err != nil {
+		_ = os.Remove(targetPath)
+		return WallpaperCache{}, err
+	}
+
+	item := WallpaperCache{
+		CacheDate:     cacheDate,
+		ImagePath:     targetName,
+		ImageMimeType: contentType,
+		Title:         image.Title,
+		Copyright:     image.Copyright,
+		CopyrightLink: image.CopyrightLink,
+		SyncedAt:      time.Now().UTC(),
+	}
+	if err := a.store.SaveWallpaperCache(ctx, item); err != nil {
+		_ = os.Remove(targetPath)
+		return WallpaperCache{}, err
+	}
+
+	if prev != nil && prev.ImagePath != "" && prev.ImagePath != item.ImagePath {
+		_ = os.Remove(filepath.Join(a.cfg.WallpapersDir, prev.ImagePath))
+	}
+
+	return item, nil
+}
+
+func (a *App) wallpaperCacheValid(item *WallpaperCache, today string) bool {
+	return item != nil && item.CacheDate == today && a.wallpaperFileExists(item)
+}
+
+func (a *App) wallpaperFileExists(item *WallpaperCache) bool {
+	if item == nil || strings.TrimSpace(item.ImagePath) == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(a.cfg.WallpapersDir, item.ImagePath))
+	return err == nil
+}
+
+func (a *App) wallpaperURL(imagePath string) string {
+	return "/wallpapers/" + url.PathEscape(imagePath)
+}
+
+func (a *App) resolveBingURL(raw string) string {
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	return strings.TrimRight(a.bingBaseURL, "/") + raw
+}
+
+func wallpaperExtension(contentType, path string) string {
+	if ext := uploadExtension(contentType); ext != ".bin" {
+		return ext
+	}
+	if ext := strings.ToLower(filepath.Ext(path)); ext != "" {
+		return ext
+	}
+	return ".jpg"
 }
 
 func (a *App) writeJSON(w http.ResponseWriter, status int, payload any) {
